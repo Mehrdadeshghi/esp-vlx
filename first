@@ -1,0 +1,117 @@
+#include <Wire.h>
+#include <VL53L0X.h>
+
+VL53L0X sensor;
+
+#define SDA_PIN 21            // SDA-Pin für I²C
+#define SCL_PIN 22            // SCL-Pin für I²C
+#define INTERRUPT_PIN GPIO_NUM_27 // Neuer GPIO-Pin für Wake-Up-Signal
+#define XSHUT_PIN 17          // GPIO-Pin für VL53L0X-Reset
+const int DISTANCE_THRESHOLD = 50; // Schwellenwert in mm
+
+void resetVL53L0X();
+void configureVL53L0XInterrupt();
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("ESP32 startet...");
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  // VL53L0X zurücksetzen
+  resetVL53L0X();
+
+  // Sensor initialisieren
+  sensor.setTimeout(500);
+  if (!sensor.init()) {
+    Serial.println("Fehler: VL53L0X konnte nicht initialisiert werden!");
+    while (1);
+  }
+  sensor.startContinuous(); // Kontinuierliche Messungen aktivieren
+  Serial.println("VL53L0X erfolgreich initialisiert!");
+
+  // GPIO1-Interrupt konfigurieren
+  configureVL53L0XInterrupt();
+
+  // Wake-Up durch GPIO27 konfigurieren
+  if (esp_sleep_enable_ext0_wakeup(INTERRUPT_PIN, 1) != ESP_OK) {
+    Serial.println("Fehler: Wake-Up-Interrupt konnte nicht konfiguriert werden!");
+  } else {
+    Serial.println("Wake-Up-Interrupt erfolgreich konfiguriert.");
+  }
+
+  // Erste Distanzprüfung
+  int distance = sensor.readRangeContinuousMillimeters();
+  if (!sensor.timeoutOccurred()) {
+    Serial.print("Gemessene Distanz: ");
+    Serial.print(distance);
+    Serial.println(" mm");
+
+    if (distance < DISTANCE_THRESHOLD) {
+      Serial.println("Distanz < 50 mm. Wechsel in Deep Sleep...");
+      delay(100); // Sicherstellen, dass die Debug-Ausgabe abgeschlossen ist
+      esp_deep_sleep_start();
+    } else {
+      Serial.println("Distanz >= 50 mm. ESP32 bleibt wach.");
+    }
+  } else {
+    Serial.println("Fehler: Timeout bei der ersten Distanzmessung.");
+  }
+}
+
+void loop() {
+  // Dieser Code wird nach dem Wake-Up ausgeführt
+  Serial.println("ESP32 ist aufgewacht!");
+
+  // VL53L0X zurücksetzen
+  resetVL53L0X();
+
+  delay(500); // Zusätzliche Verzögerung nach dem Reset
+
+  sensor.setTimeout(500);
+  if (!sensor.init()) {
+    Serial.println("Fehler: VL53L0X konnte nach Reset nicht gestartet werden!");
+    while (1);
+  }
+  sensor.startContinuous(); // Kontinuierliche Messungen aktivieren
+  Serial.println("VL53L0X erfolgreich nach Reset initialisiert!");
+
+  // Distanz erneut prüfen
+  int distance = sensor.readRangeContinuousMillimeters();
+  if (!sensor.timeoutOccurred()) {
+    Serial.print("Gemessene Distanz nach Wake-Up: ");
+    Serial.print(distance);
+    Serial.println(" mm");
+
+    if (distance < DISTANCE_THRESHOLD) {
+      Serial.println("Distanz < 50 mm. Wechsel in Deep Sleep...");
+      delay(100);
+      esp_deep_sleep_start();
+    } else {
+      Serial.println("Distanz >= 50 mm. ESP32 bleibt wach.");
+    }
+  } else {
+    Serial.println("Fehler: Timeout bei der Distanzmessung nach Wake-Up.");
+  }
+
+  delay(1000); // Zusätzliche Verzögerung, um Wake-Up-Schleifen zu vermeiden
+}
+
+void resetVL53L0X() {
+  pinMode(XSHUT_PIN, OUTPUT);
+  digitalWrite(XSHUT_PIN, LOW); // Sensor ausschalten
+  delay(100); // Wartezeit für vollständigen Shutdown
+  digitalWrite(XSHUT_PIN, HIGH); // Sensor einschalten
+  delay(100); // Wartezeit für Stabilisierung
+}
+
+void configureVL53L0XInterrupt() {
+  // Distanzschwellenwerte setzen
+  sensor.writeReg(VL53L0X::SYSTEM_THRESH_HIGH, DISTANCE_THRESHOLD);
+  sensor.writeReg(VL53L0X::SYSTEM_THRESH_LOW, 0);
+
+  // Interrupt konfigurieren: GPIO1 wird bei Überschreiten des High-Threshold HIGH
+  sensor.writeReg(VL53L0X::SYSTEM_INTERRUPT_CONFIG_GPIO, 0x04);
+  sensor.writeReg(VL53L0X::GPIO_HV_MUX_ACTIVE_HIGH, 0x10);
+  Serial.println("VL53L0X Interrupt erfolgreich konfiguriert.");
+}
