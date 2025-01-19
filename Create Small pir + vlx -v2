@@ -1,0 +1,152 @@
+#include <Wire.h>
+#include <Adafruit_VL53L0X.h>
+#include <Preferences.h> // Für NVS-Speicherung
+
+// Pin-Definitionen
+#define PIR_PIN 27  // PIR-Sensor Output Pin
+#define LED_PIN 2   // Status-LED (optional)
+
+// VL53L0X Instanz
+Adafruit_VL53L0X lox;
+Preferences preferences; // Für Speicherung von Min/Max
+
+// Globale Variablen
+int minDistance = 0;
+int maxDistance = 0;
+
+void setup() {
+  // GPIO-Konfiguration für PIR und LED
+  pinMode(PIR_PIN, INPUT);     // PIR-Sensor als Eingang
+  pinMode(LED_PIN, OUTPUT);    // LED als Ausgang
+  digitalWrite(LED_PIN, LOW);  // LED ausschalten
+
+  // Serielle Kommunikation starten
+  Serial.begin(115200);
+  delay(50); // Minimaler Delay für die serielle Konsole
+
+  preferences.begin("briefkasten", false); // Speicher initialisieren
+
+  // Wakeup-Grund überprüfen
+  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+  
+  if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0) {
+    Serial.println("\n[WAKEUP] ESP32 wurde durch PIR-Bewegung aufgeweckt!");
+    if (isPirSignalStable()) { // Überprüfen, ob das PIR-Signal stabil ist
+      handleWakeup(); // Wakeup-Ereignis verarbeiten
+    } else {
+      Serial.println("[INFO] PIR-Signal war instabil. Zurück in Deep Sleep...");
+    }
+  } else {
+    Serial.println("[INFO] Normaler Neustart. Starte Kalibrierung...");
+    calibrateVL53L0X(); // Kalibrierung durchführen
+  }
+
+  // Deep Sleep konfigurieren
+  configureDeepSleep();
+}
+
+void loop() {
+  // Der Code im Loop wird nicht verwendet, da wir Deep Sleep nutzen.
+}
+
+void calibrateVL53L0X() {
+  // VL53L0X initialisieren
+  if (!lox.begin()) {
+    Serial.println("[ERROR] VL53L0X konnte nicht initialisiert werden. Bitte überprüfen Sie die Verbindung!");
+    return;
+  }
+  Serial.println("[INFO] VL53L0X erfolgreich initialisiert.");
+
+  unsigned long startTime = millis();
+  unsigned long duration = 3000; // 3 Sekunden Kalibrierung
+
+  int currentMin = 9999; // Hoher Startwert
+  int currentMax = 0;    // Niedriger Startwert
+
+  while (millis() - startTime < duration) {
+    VL53L0X_RangingMeasurementData_t measure;
+    lox.rangingTest(&measure, false);
+
+    if (measure.RangeStatus != 4) {
+      int distance = measure.RangeMilliMeter;
+      if (distance < currentMin) currentMin = distance;
+      if (distance > currentMax) currentMax = distance;
+
+      Serial.printf("[CALIBRATION] Gemessene Distanz: %d mm\n", distance);
+    }
+    delay(50); // Kurz warten zwischen Messungen
+  }
+
+  // Min/Max-Werte speichern
+  minDistance = currentMin;
+  maxDistance = currentMax;
+
+  preferences.putInt("minDistance", minDistance);
+  preferences.putInt("maxDistance", maxDistance);
+
+  Serial.printf("[CALIBRATION COMPLETE] Min: %d mm, Max: %d mm\n", minDistance, maxDistance);
+}
+
+bool isPirSignalStable() {
+  // Prüft, ob das PIR-Signal für mindestens 300 ms stabil bleibt
+  const int stableTime = 300; // Zeit, die das Signal stabil sein muss (in ms)
+  unsigned long stableStart = millis();
+
+  while (digitalRead(PIR_PIN) == HIGH) {
+    if (millis() - stableStart > stableTime) { // Signal ist stabil
+      return true;
+    }
+    delay(10); // Kurz warten zwischen Prüfungen
+  }
+
+  return false; // Signal war nicht stabil
+}
+
+void handleWakeup() {
+  // Min/Max aus dem Speicher laden
+  minDistance = preferences.getInt("minDistance", 0);
+  maxDistance = preferences.getInt("maxDistance", 0);
+
+  Serial.printf("[DEBUG] Geladene Werte - Min: %d mm, Max: %d mm\n", minDistance, maxDistance);
+
+  if (minDistance == 0 || maxDistance == 0) {
+    Serial.println("[ERROR] Kalibrierung fehlt. Neustart erforderlich!");
+    return;
+  }
+
+  // VL53L0X initialisieren
+  if (!lox.begin()) {
+    Serial.println("[ERROR] VL53L0X konnte nicht initialisiert werden!");
+    return;
+  }
+  Serial.println("[INFO] VL53L0X erfolgreich initialisiert.");
+
+  // Messung durchführen
+  VL53L0X_RangingMeasurementData_t measure;
+  lox.rangingTest(&measure, false);
+
+  if (measure.RangeStatus != 4) {
+    int distance = measure.RangeMilliMeter;
+    Serial.printf("[MEASUREMENT] Gemessene Distanz: %d mm\n", distance);
+
+    if (distance < minDistance) {
+      Serial.println("[POST] Post wurde erkannt!");
+    } else if (distance > maxDistance) {
+      Serial.println("[OPEN] Briefkasten wurde geöffnet!");
+    } else {
+      Serial.println("[INFO] Keine Veränderung erkannt.");
+    }
+  } else {
+    Serial.println("[WARNING] Fehler bei der Abstandsmessung.");
+  }
+}
+
+void configureDeepSleep() {
+  // Sicherstellen, dass PIR stabil ist, bevor in den Deep Sleep gegangen wird
+  delay(100); // PIR-Signal stabilisieren
+
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_27, 1); // Wake-up bei HIGH-Signal von PIR
+  Serial.println("[INFO] Konfiguration abgeschlossen. Gehe in Deep Sleep...");
+  delay(100); // Kurzer Stabilisierungspuffer
+  esp_deep_sleep_start();
+}
