@@ -1,0 +1,64 @@
+from flask import Flask, request, jsonify
+import mysql.connector
+from datetime import datetime
+
+app = Flask(__name__)
+
+# MySQL-Konfiguration
+db_config = {
+    "host": "localhost",           # MySQL-Server
+    "user": "ESPv2",               # MySQL-Benutzername
+    "password": "esp_password",    # Passwort
+    "database": "ESPv2"            # Datenbankname
+}
+
+def get_db_connection():
+    """
+    Stellt eine Verbindung zur MySQL-Datenbank her.
+    """
+    try:
+        conn = mysql.connector.connect(**db_config)
+        return conn
+    except mysql.connector.Error as err:
+        print(f"Fehler bei der Verbindung zur Datenbank: {err}")
+        return None
+
+@app.route("/post", methods=["POST"])
+def receive_data():
+    """
+    Endpoint, um JSON-Daten vom ESP32 zu empfangen und in die MySQL-Datenbank zu speichern.
+    """
+    # JSON-Daten vom ESP32 abrufen
+    data = request.get_json()
+
+    # Validierung der empfangenen Daten
+    if not data or "message" not in data:
+        return jsonify({"error": "Ungültige Anfrage, 'message' fehlt"}), 400
+
+    message = data["message"]
+    timestamp = datetime.now().date()  # Aktuelles Datum
+    time = datetime.now().time()  # Aktuelle Uhrzeit
+
+    # Daten in die MySQL-Datenbank einfügen
+    conn = get_db_connection()
+    if conn is None:
+        return jsonify({"error": "Datenbankverbindung fehlgeschlagen"}), 500
+
+    try:
+        cursor = conn.cursor()
+        query = "INSERT INTO esp_data (message, timestamp, time) VALUES (%s, %s, %s)"
+        cursor.execute(query, (message, timestamp, time))
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return jsonify({"status": "success", "message": "Daten erfolgreich gespeichert"}), 201
+    except mysql.connector.Error as err:
+        print(f"Fehler beim Einfügen der Daten: {err}")
+        return jsonify({"error": "Datenbankfehler"}), 500
+    finally:
+        if conn.is_connected():
+            conn.close()
+
+if __name__ == "__main__":
+    # Flask-Server starten
+    app.run(host="0.0.0.0", port=8002, debug=True)
