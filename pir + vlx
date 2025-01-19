@@ -1,0 +1,74 @@
+#include <Wire.h>
+#include <Adafruit_VL53L0X.h>
+
+// Pin-Definitionen
+#define PIR_PIN 27  // PIR-Sensor Output Pin
+#define LED_PIN 2   // Status-LED (optional)
+
+// VL53L0X Instanz
+Adafruit_VL53L0X lox;
+
+void setup() {
+  // GPIO-Konfiguration für PIR und LED
+  pinMode(PIR_PIN, INPUT);     // PIR-Sensor als Eingang
+  pinMode(LED_PIN, OUTPUT);    // LED als Ausgang
+  digitalWrite(LED_PIN, LOW);  // LED ausschalten
+
+  // Serielle Kommunikation starten
+  Serial.begin(115200);
+  delay(50); // Minimaler Delay für die serielle Konsole
+
+  // Wakeup-Grund überprüfen
+  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+  
+  if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0) {
+    Serial.println("\n[WAKEUP] ESP32 wurde durch PIR-Bewegung aufgeweckt!");
+    startVL53L0XMeasurement(); // Messung durchführen
+  } else {
+    Serial.println("[INFO] Normaler Neustart oder unbekannter Wakeup-Grund.");
+  }
+
+  // Deep Sleep konfigurieren
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_27, 1); // Wake-up bei HIGH-Signal von PIR
+  Serial.println("[INFO] Konfiguration abgeschlossen. Gehe in Deep Sleep...");
+  delay(500);
+  esp_deep_sleep_start();
+}
+
+void loop() {
+  // Der Code im Loop wird nicht verwendet, da wir Deep Sleep nutzen.
+}
+
+void startVL53L0XMeasurement() {
+  // VL53L0X initialisieren (muss bei jedem Wakeup neu erfolgen)
+  if (!lox.begin()) {
+    Serial.println("[ERROR] VL53L0X konnte nicht initialisiert werden. Bitte überprüfen Sie die Verbindung!");
+    return; // Messung überspringen, wenn Initialisierung fehlschlägt
+  }
+  Serial.println("[INFO] VL53L0X erfolgreich initialisiert.");
+
+  // VL53L0X Timing-Budget optimieren
+  lox.setMeasurementTimingBudgetMicroSeconds(33000); // 33 ms Timing-Budget für gute Genauigkeit und schnelle Messung
+
+  // Messung mit VL53L0X starten
+  Serial.println("[INFO] Starte VL53L0X-Messungen...");
+  digitalWrite(LED_PIN, HIGH); // Status-LED einschalten (Messung aktiv)
+
+  unsigned long startTime = millis();
+  unsigned long duration = 5000; // Maximal 5 Sekunden messen
+
+  while (millis() - startTime < duration) {
+    VL53L0X_RangingMeasurementData_t measure;
+    lox.rangingTest(&measure, false); // VL53L0X Messung ausführen
+
+    if (measure.RangeStatus != 4) { // Status 4 = Fehler
+      Serial.printf("[MEASUREMENT] Abstand: %d mm\n", measure.RangeMilliMeter);
+    } else {
+      Serial.println("[WARNING] Fehler bei der Abstandsmessung.");
+    }
+    delay(1); // Minimaler Delay, um schnelle Wiederholungen zu erlauben
+  }
+
+  digitalWrite(LED_PIN, LOW); // Status-LED ausschalten
+  Serial.println("[INFO] Messungen abgeschlossen.");
+}
