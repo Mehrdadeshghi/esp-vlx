@@ -1,6 +1,15 @@
+#include <WiFi.h>             // WLAN-Bibliothek für ESP32
+#include <HTTPClient.h>       // HTTP-Client für Anfragen
 #include <Wire.h>
 #include <Adafruit_VL53L0X.h>
-#include <Preferences.h> // Für NVS-Speicherung
+#include <Preferences.h>      // Für NVS-Speicherung
+
+// WLAN-Zugangsdaten
+const char* ssid = "Eshghi2,4";         // WLAN-SSID
+const char* password = "SabziPolo";     // WLAN-Passwort
+
+// Server-Konfiguration
+const char* registrationServerUrl = "http://45.195.250.247:8002/post";  // Server-URL
 
 // Pin-Definitionen
 #define PIR_PIN 27  // PIR-Sensor Output Pin
@@ -26,6 +35,9 @@ void setup() {
 
   preferences.begin("briefkasten", false); // Speicher initialisieren
 
+  // WLAN-Verbindung herstellen
+  connectToWiFi();
+
   // Wakeup-Grund überprüfen
   esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
   
@@ -47,6 +59,40 @@ void setup() {
 
 void loop() {
   // Der Code im Loop wird nicht verwendet, da wir Deep Sleep nutzen.
+}
+
+void connectToWiFi() {
+  Serial.printf("[WIFI] Verbinde mit WLAN: %s\n", ssid);
+  WiFi.begin(ssid, password); // WLAN-Verbindung starten
+
+  int retries = 0;
+  while (WiFi.status() != WL_CONNECTED && retries < 20) {
+    delay(500);
+    Serial.print(".");
+    retries++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\n[WIFI] Erfolgreich verbunden! IP-Adresse: %s\n", WiFi.localIP().toString().c_str());
+  } else {
+    Serial.println("\n[WIFI] Verbindung fehlgeschlagen. Neustart...");
+    ESP.restart(); // Neustart bei Verbindungsfehler
+  }
+}
+
+bool isPirSignalStable() {
+  // Prüft, ob das PIR-Signal für mindestens 300 ms stabil bleibt
+  const int stableTime = 300; // Zeit, die das Signal stabil sein muss (in ms)
+  unsigned long stableStart = millis();
+
+  while (digitalRead(PIR_PIN) == HIGH) {
+    if (millis() - stableStart > stableTime) { // Signal ist stabil
+      return true;
+    }
+    delay(10); // Kurz warten zwischen Prüfungen
+  }
+
+  return false; // Signal war nicht stabil
 }
 
 void calibrateVL53L0X() {
@@ -87,21 +133,6 @@ void calibrateVL53L0X() {
   Serial.printf("[CALIBRATION COMPLETE] Min: %d mm, Max: %d mm\n", minDistance, maxDistance);
 }
 
-bool isPirSignalStable() {
-  // Prüft, ob das PIR-Signal für mindestens 300 ms stabil bleibt
-  const int stableTime = 300; // Zeit, die das Signal stabil sein muss (in ms)
-  unsigned long stableStart = millis();
-
-  while (digitalRead(PIR_PIN) == HIGH) {
-    if (millis() - stableStart > stableTime) { // Signal ist stabil
-      return true;
-    }
-    delay(10); // Kurz warten zwischen Prüfungen
-  }
-
-  return false; // Signal war nicht stabil
-}
-
 void handleWakeup() {
   // Min/Max aus dem Speicher laden
   minDistance = preferences.getInt("minDistance", 0);
@@ -131,8 +162,10 @@ void handleWakeup() {
 
     if (distance < minDistance) {
       Serial.println("[POST] Post wurde erkannt!");
+      sendToServer("POST erkannt"); // Nachricht an Server senden
     } else if (distance > maxDistance) {
       Serial.println("[OPEN] Briefkasten wurde geöffnet!");
+      sendToServer("Briefkasten geöffnet"); // Nachricht an Server senden
     } else {
       Serial.println("[INFO] Keine Veränderung erkannt.");
     }
@@ -141,10 +174,33 @@ void handleWakeup() {
   }
 }
 
-void configureDeepSleep() {
-  // Sicherstellen, dass PIR stabil ist, bevor in den Deep Sleep gegangen wird
-  delay(100); // PIR-Signal stabilisieren
+void sendToServer(const char* message) {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
 
+    // URL direkt nutzen
+    http.begin(registrationServerUrl);
+    http.addHeader("Content-Type", "application/json");
+
+    // JSON-Daten senden
+    String jsonPayload = String("{\"message\": \"") + message + "\"}";
+    int httpResponseCode = http.POST(jsonPayload);
+
+    if (httpResponseCode > 0) {
+      Serial.printf("[HTTP] Serverantwort: %d\n", httpResponseCode);
+      String response = http.getString();
+      Serial.printf("[HTTP] Serverantwort: %s\n", response.c_str());
+    } else {
+      Serial.printf("[HTTP] Anfrage fehlgeschlagen. Fehler: %s\n", http.errorToString(httpResponseCode).c_str());
+    }
+
+    http.end();
+  } else {
+    Serial.println("[HTTP] Keine WLAN-Verbindung. Nachricht nicht gesendet.");
+  }
+}
+
+void configureDeepSleep() {
   esp_sleep_enable_ext0_wakeup(GPIO_NUM_27, 1); // Wake-up bei HIGH-Signal von PIR
   Serial.println("[INFO] Konfiguration abgeschlossen. Gehe in Deep Sleep...");
   delay(100); // Kurzer Stabilisierungspuffer
