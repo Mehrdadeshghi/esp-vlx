@@ -1,0 +1,251 @@
+#include <WiFi.h>             // WLAN-Bibliothek für ESP32
+#include <HTTPClient.h>       // HTTP-Client für Anfragen
+#include <Wire.h>
+#include <Adafruit_VL53L0X.h>
+#include <Preferences.h>      // Für NVS-Speicherung
+
+// WLAN-Zugangsdaten
+const char* ssid = "Eshghi2,4";         // WLAN-SSID
+const char* password = "SabziPolo";     // WLAN-Passwort
+
+// Server-Konfiguration
+const char* registrationServerUrl = "http://45.195.250.247:8002/post";  // Server-URL
+
+// Pin-Definitionen
+#define PIR_PIN 27  // PIR-Sensor Output Pin
+#define LED_PIN 2   // Status-LED (optional)
+
+// VL53L0X Instanz
+Adafruit_VL53L0X lox;
+Preferences preferences; // Für Speicherung von Min/Max
+
+// Globale Variablen
+int minDistance = 0;
+int maxDistance = 0;
+
+void setup() {
+  pinMode(PIR_PIN, INPUT);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  Serial.begin(115200);
+  delay(50);
+
+  preferences.begin("briefkasten", false);
+
+  // Reset-Grund überprüfen
+  if (esp_reset_reason() == ESP_RST_POWERON) {
+    Serial.println("[INFO] Neustart erkannt (Stromlos -> Strom). Starte Kalibrierung...");
+    calibrateVL53L0X();
+  } else {
+    // Kalibrierungswerte laden
+    minDistance = preferences.getInt("minDistance", 0);
+    maxDistance = preferences.getInt("maxDistance", 0);
+
+    if (minDistance == 0 || maxDistance == 0) {
+      Serial.println("[ERROR] Keine Kalibrierung vorhanden! Kalibrierung erforderlich.");
+      calibrateVL53L0X();
+    } else {
+      Serial.printf("[INFO] Geladene Kalibrierungswerte: Min: %d mm, Max: %d mm\n", minDistance, maxDistance);
+    }
+  }
+
+  // Wakeup-Grund überprüfen
+  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+  if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0) {
+    Serial.println("[WAKEUP] ESP32 wurde durch PIR-Bewegung aufgeweckt!");
+    if (isPirSignalStable()) {
+      handleWakeup();
+    } else {
+      Serial.println("[INFO] PIR-Signal war instabil. Zurück in Deep Sleep...");
+    }
+  }
+
+  configureDeepSleep();
+}
+
+void loop() {
+  // Da wir Deep Sleep nutzen, wird hier nichts ausgeführt.
+}
+
+/**
+ * Prüft, ob das PIR-Signal für mindestens 300 ms stabil HIGH bleibt.
+ */
+bool isPirSignalStable() {
+  const int stableTime = 300; // Zeit, die das Signal stabil sein muss (in ms)
+  unsigned long stableStart = millis();
+
+  while (digitalRead(PIR_PIN) == HIGH) {
+    if (millis() - stableStart > stableTime) {
+      return true;
+    }
+    delay(10);
+  }
+  return false;
+}
+
+/**
+ * Führt eine Kalibrierung des VL53L0X durch.
+ */
+void calibrateVL53L0X() {
+  if (!lox.begin()) {
+    Serial.println("[ERROR] VL53L0X konnte nicht initialisiert werden!");
+    return;
+  }
+
+  unsigned long startTime = millis();
+  unsigned long duration = 3000; // Kalibrierungsdauer: 3 Sekunden
+  int currentMin = 9999;
+  int currentMax = 0;
+
+  while (millis() - startTime < duration) {
+    VL53L0X_RangingMeasurementData_t measure;
+    lox.rangingTest(&measure, false);
+
+    if (measure.RangeStatus != 4) {
+      int distance = measure.RangeMilliMeter;
+      if (distance < currentMin) currentMin = distance;
+      if (distance > currentMax) currentMax = distance;
+      Serial.printf("[CALIBRATION] Distanz: %d mm\n", distance);
+    } else {
+      Serial.println("[WARNING] Ungültige Messung während der Kalibrierung.");
+    }
+
+    delay(50);
+  }
+
+  if (currentMin < 9999 && currentMax > 0) {
+    minDistance = currentMin;
+    maxDistance = currentMax;
+    preferences.putInt("minDistance", minDistance);
+    preferences.putInt("maxDistance", maxDistance);
+    Serial.printf("[CALIBRATION COMPLETE] Min: %d mm, Max: %d mm\n", minDistance, maxDistance);
+  } else {
+    Serial.println("[ERROR] Kalibrierung fehlgeschlagen! Keine gültigen Werte erhalten.");
+  }
+}
+
+/**
+ * Führt kontinuierliche Messungen für 5 Sekunden durch und wertet am Ende die Ergebnisse aus.
+ */
+void measureForFiveSeconds() {
+  if (!lox.begin()) {
+    Serial.println("[ERROR] VL53L0X konnte nicht initialisiert werden!");
+    return;
+  }
+
+  lox.setMeasurementTimingBudgetMicroSeconds(20000); // 20 ms Timing-Budget
+  unsigned long startTime = millis();
+  bool briefErkannt = false;
+  bool kastenGeöffnet = false;
+  int detectedDistance = 0;
+
+  while (millis() - startTime < 5000) { // 5 Sekunden
+    VL53L0X_RangingMeasurementData_t measure;
+    lox.rangingTest(&measure, false);
+
+    if (measure.RangeStatus != 4) {
+      int distance = measure.RangeMilliMeter;
+      Serial.printf("[MEASUREMENT] Distanz: %d mm\n", distance);
+
+      // Prüfen, ob ein Ereignis erkannt wurde
+      if (distance < minDistance) {
+        briefErkannt = true; // Brief erkannt
+        detectedDistance = distance;
+      } else if (distance > maxDistance) {
+        kastenGeöffnet = true; // Briefkasten geöffnet
+        detectedDistance = distance;
+      }
+    } else {
+      Serial.println("[WARNING] Ungültige Messung.");
+    }
+
+    delay(20);
+  }
+
+  // Ereignis auswerten
+  Serial.printf("[INFO] Kalibrierungswerte: Min: %d mm, Max: %d mm\n", minDistance, maxDistance);
+
+  if (briefErkannt) {
+    Serial.printf("[POST] Brief erkannt bei Distanz: %d mm\n", detectedDistance);
+    connectToWiFi();
+    sendToServer("POST erkannt");
+  } else if (kastenGeöffnet) {
+    Serial.printf("[OPEN] Briefkasten geöffnet bei Distanz: %d mm\n", detectedDistance);
+    connectToWiFi();
+    sendToServer("Briefkasten geöffnet");
+  } else {
+    Serial.println("[INFO] Kein Ereignis erkannt.");
+  }
+
+  configureDeepSleep();
+}
+
+/**
+ * Verarbeitet das Wakeup-Ereignis.
+ */
+void handleWakeup() {
+  measureForFiveSeconds();
+}
+
+/**
+ * Baut eine WLAN-Verbindung auf.
+ */
+void connectToWiFi() {
+  Serial.printf("[WIFI] Verbinde mit WLAN: %s\n", ssid);
+  WiFi.begin(ssid, password);
+
+  int retries = 0;
+  const int maxRetries = 20; // Maximale Anzahl der Versuche
+  const int retryDelay = 500; // Wartezeit pro Versuch in ms
+  unsigned long startTime = millis();
+
+  while (WiFi.status() != WL_CONNECTED && retries < maxRetries) {
+    delay(retryDelay); // Wartezeit zwischen den Versuchen
+    Serial.print(".");
+    retries++;
+
+    // Überprüfen, ob die maximale Zeit überschritten wurde (zusätzliche Sicherheit)
+    if (millis() - startTime > maxRetries * retryDelay) {
+      break;
+    }
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\n[WIFI] Erfolgreich verbunden! IP-Adresse: %s\n", WiFi.localIP().toString().c_str());
+  } else {
+    Serial.println("\n[WIFI] Verbindung fehlgeschlagen! Überspringe WLAN-Aktionen.");
+  }
+}
+
+
+/**
+ * Sendet Daten an den Server.
+ */
+void sendToServer(const char* message) {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    http.begin(registrationServerUrl);
+    http.addHeader("Content-Type", "application/json");
+    String payload = String("{\"message\": \"") + message + "\"}";
+    int responseCode = http.POST(payload);
+    if (responseCode > 0) {
+      Serial.printf("[HTTP] Antwort: %d\n", responseCode);
+    } else {
+      Serial.printf("[HTTP] Fehler: %s\n", http.errorToString(responseCode).c_str());
+    }
+    http.end();
+  } else {
+    Serial.println("[HTTP] Keine WLAN-Verbindung!");
+  }
+}
+
+/**
+ * Konfiguriert und startet den Deep Sleep.
+ */
+void configureDeepSleep() {
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_27, 1);
+  Serial.println("[INFO] Deep Sleep konfiguriert...");
+  delay(100);
+  esp_deep_sleep_start();
+}
