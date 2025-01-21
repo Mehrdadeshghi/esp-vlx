@@ -1,26 +1,16 @@
-#include <WiFi.h>
-#include <nvs.h>
 #include <nvs_flash.h>
-
-void resetWiFiSettings() {
-  // Initialisiere NVS
-  esp_err_t err = nvs_flash_init();
-  if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-    // Lösche NVS, falls kein Platz mehr vorhanden ist oder eine neue Version vorliegt
-    nvs_flash_erase();
-    nvs_flash_init();
-  }
-  
-  // Lösche den WiFi-Stack-Speicher
-  WiFi.disconnect(true, true);
-  Serial.println("WLAN-Einstellungen wurden zurückgesetzt!");
-}
+#include <esp_system.h>
 
 void setup() {
   Serial.begin(115200);
   
-  // WLAN zurücksetzen
-  resetWiFiSettings();
+  // NVS-Speicher komplett löschen
+  esp_err_t err = nvs_flash_erase();
+  if (err == ESP_OK) {
+    Serial.println("NVS-Speicher erfolgreich gelöscht!");
+  } else {
+    Serial.printf("Fehler beim Löschen des NVS-Speichers: %s\n", esp_err_to_name(err));
+  }
   
   // Neustart nach dem Löschen
   Serial.println("ESP32 wird neu gestartet...");
@@ -29,5 +19,5 @@ void setup() {
 }
 
 void loop() {
-  // Loop kann leer bleiben
+  // Leer
 }
