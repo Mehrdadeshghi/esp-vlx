@@ -1,0 +1,531 @@
+/*****************************************************
+ *  Code für VL53L1X (Pololu-Library) + PIR + Deep Sleep
+ *****************************************************/
+
+#include <WiFi.h>         // WLAN-Bibliothek für ESP32
+#include <HTTPClient.h>   // HTTP-Client für Anfragen
+#include <Wire.h>
+#include <VL53L1X.h>      // WICHTIG: Pololu-Library, nicht Adafruit!
+#include <Preferences.h>  // Für NVS-Speicherung
+#include <WiFiManager.h>  // Für Captive Portal
+
+// ---------------------- Konfiguration ---------------------- //
+
+// Server-Endpunkte
+const char* registrationServerUrl = "http://45.195.250.247:8002/device";
+const char* calibrationServerUrl  = "http://45.195.250.247:8002/calibration";
+const char* letterServerUrl       = "http://45.195.250.247:8002/letter";
+const char* doorServerUrl         = "http://45.195.250.247:8002/door";
+const char* keepaliveServerUrl    = "http://45.195.250.247:8002/keepalive";
+
+// Pin-Definitionen
+#define PIR_PIN 27         // PIR-Sensor Output Pin
+#define LED_PIN 2          // Status-LED (optional)
+#define RESET_BUTTON_PIN 0 // Reset-Taster (z.B. GPIO0)
+
+// VL53L1X Instanz (Pololu-Klasse, NICHT Adafruit)
+VL53L1X lox;
+
+// Preferences Instanz
+Preferences preferences;
+
+// Globale Variablen für Kalibrierung
+int minDistance = 0;
+int maxDistance = 0;
+
+// Globale Variablen für Keep-Alive
+unsigned long lastKeepAlive = 0;
+const unsigned long keepAliveInterval = 15 * 60 * 1000; // 15 Minuten in Millisekunden
+
+// Funktionsprototypen
+void calibrateVL53L1X();
+void measureForFiveSeconds();
+void sendDeviceInfo();
+void sendCalibrationData();
+void sendLetterEvent(int distance);
+void sendDoorEvent(int distance);
+void sendKeepAlive();
+void sendToServer(const char* serverUrl, String jsonPayload);
+void configureDeepSleep();
+bool isResetButtonPressed();
+void connectToWiFi();
+
+/**
+ * Baut eine WLAN-Verbindung auf, indem es versucht, sich
+ * mit den gespeicherten Zugangsdaten zu verbinden.
+ */
+void connectToWiFi() {
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("[WIFI] Bereits verbunden.");
+    return;
+  }
+  Serial.println("[WIFI] Versuche, eine Verbindung mit gespeicherten WLAN-Daten herzustellen...");
+  WiFi.begin(); // Beginnt mit den gespeicherten WLAN-Daten
+
+  int retries = 0;
+  const int maxRetries = 20; 
+  const int retryDelay = 500; 
+
+  while (WiFi.status() != WL_CONNECTED && retries < maxRetries) {
+    delay(retryDelay);
+    Serial.print(".");
+    retries++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\n[WIFI] Erfolgreich verbunden! IP-Adresse: %s\n", WiFi.localIP().toString().c_str());
+  } else {
+    Serial.println("\n[WIFI] Verbindung fehlgeschlagen! Starte erneut...");
+    WiFi.disconnect();  // Trennen der aktuellen Verbindung
+    WiFi.mode(WIFI_OFF);
+    delay(1000);
+    WiFi.mode(WIFI_STA); 
+    WiFi.begin();
+    retries = 0;
+    while (WiFi.status() != WL_CONNECTED && retries < maxRetries) {
+      delay(retryDelay);
+      Serial.print(".");
+      retries++;
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.printf("\n[WIFI] Erfolgreich verbunden nach erneutem Versuch! IP-Adresse: %s\n", WiFi.localIP().toString().c_str());
+    } else {
+      Serial.println("\n[WIFI] Verbindung nach erneutem Versuch fehlgeschlagen!");
+    }
+  }
+}
+
+// ---------------------- Setup ---------------------- //
+
+void setup() {
+  // Initialisierung der Pins
+  pinMode(PIR_PIN, INPUT);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  
+  pinMode(RESET_BUTTON_PIN, INPUT_PULLUP); // Taster mit internem Pull-up
+
+  // Serielle Kommunikation starten
+  Serial.begin(115200);
+  delay(200);  // Pufferzeit für serielle Initialisierung
+
+  // I2C starten (wichtig für VL53L1X)
+  Wire.begin(); // SDA = GPIO21, SCL = GPIO22 beim ESP32
+  
+  // Preferences initialisieren
+  preferences.begin("briefkasten", false);
+
+  // Überprüfen, ob der Reset-Taster gedrückt ist
+  bool resetWifi = isResetButtonPressed();
+
+  // WiFiManager initialisieren
+  WiFiManager wifiManager;
+
+  if (resetWifi) {
+    Serial.println("[INFO] Reset-Taster gedrückt. Lösche gespeicherte WLAN-Daten.");
+    wifiManager.resetSettings(); // Gespeicherte WLAN-Daten löschen
+  }
+
+  // Wakeup-Grund überprüfen
+  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+
+  if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0) {
+    // ESP32 wurde durch PIR-Sensor aufgeweckt
+    Serial.println("============================================");
+    Serial.println("[WAKEUP] ESP32 wurde durch PIR-Sensor geweckt!");
+
+    // Lokale MAC-Adresse und Kalibrierungsdaten aus Preferences abrufen
+    String macAddress = preferences.getString("mac_address", "Nicht gesetzt");
+    minDistance = preferences.getInt("minDistance", 0);
+    maxDistance = preferences.getInt("maxDistance", 0);
+
+    Serial.printf("[INFO] Lokale MAC-Adresse: '%s'\n", macAddress.c_str());
+    Serial.printf("[INFO] Geladene Kalibrierungswerte: Min: %d mm, Max: %d mm\n", minDistance, maxDistance);
+    Serial.println("============================================");
+
+    // Überprüfen, ob Kalibrierungsdaten vorhanden sind
+    if (minDistance == 0 || maxDistance == 0) {
+      Serial.println("[ERROR] Keine Kalibrierungsdaten gefunden! Starte Kalibrierung...");
+      calibrateVL53L1X();
+    }
+
+    // VL53L1X messen und Ereignisse erkennen
+    measureForFiveSeconds();
+
+    // Ereignisse wurden in den entsprechenden Funktionen gesendet, jetzt Deep Sleep
+    configureDeepSleep();
+
+  } else if (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER) {
+    // ESP32 wurde durch Timer aufgeweckt (Keep-Alive)
+    Serial.println("============================================");
+    Serial.println("[WAKEUP] ESP32 wurde durch Timer (Keep-Alive) geweckt!");
+
+    // Lokale MAC-Adresse aus Preferences abrufen
+    String macAddress = preferences.getString("mac_address", "Nicht gesetzt");
+
+    Serial.printf("[INFO] Lokale MAC-Adresse: '%s'\n", macAddress.c_str());
+    Serial.println("============================================");
+
+    // WiFi-Verbindung sicherstellen
+    connectToWiFi();
+
+    // Keep-Alive senden
+    sendKeepAlive();
+
+    // Zurück in den Deep Sleep
+    configureDeepSleep();
+
+  } else {
+    // ESP32 startet neu (Power On oder Reset)
+    Serial.println("============================================");
+    Serial.println("[INFO] ESP32 startet neu (Power On oder Reset).");
+
+    // Starten des Captive Portals mit WiFiManager
+    if (!wifiManager.autoConnect("BriefkastenAP")) {
+      Serial.println("[WIFI] Verbindung fehlgeschlagen und Timeout erreicht");
+      ESP.restart();
+      delay(1000);
+    }
+
+    Serial.printf("\n[WIFI] Erfolgreich verbunden! IP-Adresse: %s\n", WiFi.localIP().toString().c_str());
+
+    // MAC-Adresse auslesen
+    String macAddress = WiFi.macAddress();
+    Serial.printf("[INFO] Ausgelesene MAC-Adresse: '%s'\n", macAddress.c_str());
+
+    // MAC-Adresse lokal speichern, falls noch nicht geschehen
+    if (!preferences.isKey("mac_address")) {
+      preferences.putString("mac_address", macAddress);
+      Serial.println("[INFO] MAC-Adresse lokal gespeichert.");
+    } else {
+      String storedMac = preferences.getString("mac_address", "Nicht gesetzt");
+      Serial.printf("[INFO] Lokal gespeicherte MAC-Adresse: '%s'\n", storedMac.c_str());
+      if (storedMac != macAddress) {
+        Serial.println("[WARNING] Aktuelle MAC-Adresse stimmt nicht mit gespeicherter überein. Aktualisiere...");
+        preferences.putString("mac_address", macAddress);
+      }
+    }
+
+    // Senden der Geräteinformationen an den Server
+    sendDeviceInfo();
+
+    // Warte 1 Minute, bevor die Kalibrierung beginnt
+    Serial.println("[INFO] Warte 1 Minute vor der Kalibrierung...");
+   // delay(60000);
+
+    // Kalibrierung durchführen
+    calibrateVL53L1X();
+
+    // Senden der Kalibrierungsdaten an den Server
+    sendCalibrationData();
+
+    Serial.println("============================================");
+
+    // Deep Sleep konfigurieren und starten
+    configureDeepSleep();
+  }
+}
+
+void loop() {
+  // Keep-Alive alle 15 Minuten senden
+  if (millis() - lastKeepAlive >= keepAliveInterval) {
+    connectToWiFi();
+    sendKeepAlive();
+    lastKeepAlive = millis();
+  }
+  // Dieser Code geht ohnehin in Deep Sleep zurück nach setup()
+}
+
+/* ---------------------- Funktionen ---------------------- */
+
+/**
+ * Prüft, ob der Reset-Taster gedrückt ist.
+ * @return true, wenn der Taster gedrückt ist, sonst false.
+ */
+bool isResetButtonPressed() {
+  const unsigned long debounceTime = 2000; // 2 Sekunden
+  unsigned long pressedTime = 0;
+
+  if (digitalRead(RESET_BUTTON_PIN) == LOW) { // Taster gedrückt (Pull-up)
+    Serial.println("[INFO] Reset-Taster erkannt. Starte Reset-Prozess.");
+    pressedTime = millis();
+    while (digitalRead(RESET_BUTTON_PIN) == LOW) {
+      delay(100);
+      if (millis() - pressedTime > debounceTime) {
+        Serial.println("[INFO] Reset-Taster lange gedrückt. Setze WiFi-Daten zurück.");
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Führt eine Kalibrierung des VL53L1X (Pololu) durch.
+ */
+void calibrateVL53L1X() {
+  Serial.println("[CALIBRATION] Initialisiere VL53L1X...");
+
+  if (!lox.init()) {
+    Serial.println("[ERROR] VL53L1X konnte nicht initialisiert werden!");
+    return;
+  }
+
+  // Beispiel: 20 ms Mess-Timing-Budget
+  lox.setMeasurementTimingBudget(33000);
+  // Startet kontinuierliche Messung mit Intervall 50 ms
+  lox.startContinuous(33);
+
+  //lox.setDistanceMode(VL53L1X::Short); // Für kurze Abstände optimieren
+
+  unsigned long startTime = millis();
+  unsigned long duration = 3000; // Kalibrierungsdauer: 3 Sekunden
+  int currentMin = 9999;
+  int currentMax = 0;
+
+  Serial.println("[CALIBRATION] Messe für 3 Sekunden, um Min/Max zu ermitteln...");
+  while (millis() - startTime < duration) {
+    if (lox.dataReady()) {
+      lox.read(false);
+      if (lox.ranging_data.range_status == 0) {
+        int distance = lox.ranging_data.range_mm;
+        Serial.printf("[CALIBRATION] Distanz: %d mm\n", distance);
+
+        if (distance < currentMin) currentMin = distance;
+        if (distance > currentMax) currentMax = distance;
+      } else {
+        Serial.println("[CALIBRATION WARNING] Ungültige Messung während Kalibrierung.");
+      }
+    }
+    delay(10);
+  }
+
+  lox.stopContinuous();
+
+  // Wenn wir gültige Werte erhalten haben, übernehmen wir sie und fügen ±10 mm hinzu
+  if (currentMin < 9999 && currentMax > 0) {
+    // Option: Sicherstellen, dass minDistance nicht unter 0 fällt
+    // Falls dir das egal ist, kannst du direkt (currentMin - 10) nehmen
+    minDistance = max(0, currentMin - 10);  
+    maxDistance = currentMax + 10;
+
+    // In den Preferences speichern
+    preferences.putInt("minDistance", minDistance);
+    preferences.putInt("maxDistance", maxDistance);
+
+    Serial.printf("[CALIBRATION COMPLETE] Min: %d mm, Max: %d mm\n", minDistance, maxDistance);
+  } else {
+    Serial.println("[ERROR] Kalibrierung fehlgeschlagen! Keine gültigen Werte erhalten.");
+  }
+}
+
+
+/**
+ * Führt kontinuierliche Messungen für 5 Sekunden durch und wertet die Ergebnisse aus.
+ */
+/**
+ * Führt kontinuierliche Messungen für 5 Sekunden durch und wertet die Ergebnisse 
+ * ERST am Ende der Messzeit aus. Wenn ein Brief erkannt wurde (distance < minDistance) 
+ * oder die Tür geöffnet (distance > maxDistance), wird nur der erste auslösende 
+ * Distanzwert gesendet.
+ */
+void measureForFiveSeconds() {
+  Serial.println("[MEASURE] Starte 5-Sekunden-Messung...");
+
+  // Sensor init (Pololu-Library vorausgesetzt)
+  if (!lox.init()) {
+    Serial.println("[ERROR] VL53L1X konnte nicht initialisiert werden!");
+    return;
+  }
+
+  // Mess-Budget anpassen, z.B. 20 ms
+  lox.setMeasurementTimingBudget(33000);
+
+  lox.setDistanceMode(VL53L1X::Short); // Für kurze Abstände optimieren
+  // Starte kontinuierliche Messung alle 50 ms
+  lox.startContinuous(20);
+
+
+
+  // Wir speichern alle Messungen in einem Array/Vector
+  const int MAX_SAMPLES = 200; // 5s / 25Hz ~ 125 Messungen, also Reserve
+  int distances[MAX_SAMPLES];
+  int sampleCount = 0;
+
+  unsigned long startTime = millis();
+  while (millis() - startTime < 5000) { // 5 Sekunden
+    if (lox.dataReady()) {
+      lox.read(false); // nicht blockierend auslesen
+      if (lox.ranging_data.range_status == 0) {
+        int distance = lox.ranging_data.range_mm;
+        Serial.printf("[MEASUREMENT] Distanz: %d mm\n", distance);
+
+        // Im Array speichern, sofern noch Platz ist
+        if (sampleCount < MAX_SAMPLES) {
+          distances[sampleCount++] = distance;
+        }
+      } else {
+        Serial.println("[MEASUREMENT WARNING] Ungültige Messung.");
+      }
+    }
+    delay(20);
+  }
+
+  lox.stopContinuous();
+
+  // Jetzt nachträglich im Array auswerten
+  bool briefErkannt = false;
+  bool kastenGeoeffnet = false;
+  int detectedDistance = 0;
+
+  // Option: Wir merken uns den ERSTEN auslösenden Wert
+  // Falls du "Tür" priorisieren willst, änderst du die Reihenfolge oder baust Logik ein.
+  for (int i = 0; i < sampleCount; i++) {
+    int dist = distances[i];
+    
+    // Nur prüfen, wenn noch kein Ereignis erkannt wurde
+    if (!briefErkannt && !kastenGeoeffnet) {
+      if (dist < minDistance) {
+        briefErkannt = true;
+        detectedDistance = dist;
+      } else if (dist > maxDistance) {
+        kastenGeoeffnet = true;
+        detectedDistance = dist;
+      }
+    }
+  }
+
+  // Ereignis(e) melden
+  if (briefErkannt) {
+    Serial.printf("[POST] Brief erkannt bei Distanz: %d mm\n", detectedDistance);
+    sendLetterEvent(detectedDistance);
+  } else if (kastenGeoeffnet) {
+    Serial.printf("[OPEN] Briefkasten geöffnet bei Distanz: %d mm\n", detectedDistance);
+    sendDoorEvent(detectedDistance);
+  } else {
+    Serial.println("[INFO] Kein Ereignis erkannt.");
+  }
+}
+
+
+/**
+ * Senden der Geräteinformationen an den Server.
+ */
+void sendDeviceInfo() {
+  Serial.println("[DEBUG] -> sendDeviceInfo()");
+
+  String macAddress = preferences.getString("mac_address", "Nicht gesetzt");
+  Serial.printf("[DEBUG] Lokale MAC-Adresse beim Registrieren: '%s'\n", macAddress.c_str());
+
+  String jsonPayload = String("{\"mac_address\": \"") + macAddress + 
+                       "\", \"firmware_version\": \"1.0.0\"}";
+  sendToServer(registrationServerUrl, jsonPayload);
+}
+
+/**
+ * Senden der Kalibrierungsdaten an den Server.
+ */
+void sendCalibrationData() {
+  Serial.println("[DEBUG] -> sendCalibrationData()");
+
+  String macAddress = preferences.getString("mac_address", "Nicht gesetzt");
+  Serial.printf("[DEBUG] Lokale MAC-Adresse bei Kalibrierung: '%s'\n", macAddress.c_str());
+
+  String jsonPayload = String("{\"mac_address\": \"") + macAddress +
+                       "\", \"min_distance\": " + minDistance +
+                       ", \"max_distance\": " + maxDistance + "}";
+  sendToServer(calibrationServerUrl, jsonPayload);
+}
+
+/**
+ * Senden eines Briefereignisses an den Server.
+ */
+void sendLetterEvent(int distance) {
+  Serial.println("[DEBUG] -> sendLetterEvent()");
+
+  String macAddress = preferences.getString("mac_address", "Nicht gesetzt");
+  Serial.printf("[DEBUG] Lokale MAC-Adresse beim Brief-Event: '%s'\n", macAddress.c_str());
+
+  String jsonPayload = String("{\"mac_address\": \"") + macAddress +
+                       "\", \"event\": \"letter_detected\", \"distance\": " + distance + "}";
+  sendToServer(letterServerUrl, jsonPayload);
+}
+
+/**
+ * Senden eines Türöffnungsereignisses an den Server.
+ */
+void sendDoorEvent(int distance) {
+  Serial.println("[DEBUG] -> sendDoorEvent()");
+
+  String macAddress = preferences.getString("mac_address", "Nicht gesetzt");
+  Serial.printf("[DEBUG] Lokale MAC-Adresse beim Tür-Event: '%s'\n", macAddress.c_str());
+
+  String jsonPayload = String("{\"mac_address\": \"") + macAddress +
+                       "\", \"event\": \"door_opened\", \"distance\": " + distance + "}";
+  sendToServer(doorServerUrl, jsonPayload);
+}
+
+/**
+ * Senden der Keep-Alive-Daten an den Server.
+ */
+void sendKeepAlive() {
+  Serial.println("[DEBUG] -> sendKeepAlive()");
+
+  String macAddress = preferences.getString("mac_address", "Nicht gesetzt");
+  Serial.printf("[DEBUG] Lokale MAC-Adresse beim KeepAlive: '%s'\n", macAddress.c_str());
+
+  String jsonPayload = String("{\"mac_address\": \"") + macAddress + "\"}";
+  sendToServer(keepaliveServerUrl, jsonPayload);
+}
+
+/**
+ * Senden einer JSON-Nachricht an den Server.
+ */
+void sendToServer(const char* serverUrl, String jsonPayload) {
+  Serial.println("--------------------------------------------");
+  Serial.printf("[DEBUG] Sende POST an URL: %s\n", serverUrl);
+  Serial.printf("[DEBUG] Payload: %s\n", jsonPayload.c_str());
+  Serial.println("--------------------------------------------");
+
+  // WiFi-Verbindung überprüfen
+  connectToWiFi();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    http.begin(serverUrl);
+    http.addHeader("Content-Type", "application/json");
+
+    int httpResponseCode = http.POST(jsonPayload);
+    if (httpResponseCode > 0) {
+      // Server-Antwort lesen
+      String responseBody = http.getString();
+      Serial.printf("[HTTP] Antwort-Code: %d\n", httpResponseCode);
+      Serial.printf("[HTTP] Antwort-Body: %s\n", responseBody.c_str());
+    } else {
+      Serial.printf("[HTTP] Fehler beim Senden: %s\n",
+                    http.errorToString(httpResponseCode).c_str());
+    }
+
+    http.end();
+  } else {
+    Serial.println("[HTTP] WLAN-Verbindung fehlgeschlagen. Konnte nicht senden.");
+  }
+}
+
+/**
+ * Konfiguriert und startet den Deep Sleep.
+ */
+void configureDeepSleep() {
+  Serial.println("[DEBUG] -> configureDeepSleep()");
+
+  // Wakeup durch PIR-Sensor (GPIO 27, HIGH Level)
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_27, 1);
+
+  // Wakeup durch Timer alle 15 Minuten
+  esp_sleep_enable_timer_wakeup(keepAliveInterval * 1000); // in Mikrosekunden
+
+  Serial.println("[INFO] Deep Sleep wird in 5 Sekunden gestartet...");
+  delay(5000); // Wartezeit für Debug-Ausgaben
+  Serial.println("[INFO] Jetzt Deep Sleep!");
+  esp_deep_sleep_start();
+}
