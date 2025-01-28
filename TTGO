@@ -1,12 +1,13 @@
+// Debugging aktivieren
 #define TINY_GSM_DEBUG Serial
 #define TINY_GSM_DEBUG_LEVEL 1
-// Modem-Typ definieren
-#define TINY_GSM_MODEM_SIM800
+
 #include <TinyGsmClient.h>
 #include <Wire.h>
 #include <SPI.h>
 
-
+// Modem-Typ definieren
+#define TINY_GSM_MODEM_SIM800
 
 // Pin-Definitionen
 #define MODEM_RST       5
@@ -19,20 +20,33 @@
 #define MODEM_BAUD_RATE 115200  // 115.2 Kb/s Baudrate
 
 // APN Einstellungen für Vodafone
-const char apn[]  = "event.vodafone.de"; // Vodafone APN
+const char apn[]  = "internet"; // Standard APN für Vodafone
 const char user[] = "";
 const char pass[] = "";
 
 // SIM-PIN, falls erforderlich (leer lassen, wenn nicht benötigt)
 const char simPIN[] = ""; // Beispiel: "1234"
 
+// RGB LED Pins (Anpassen nach Bedarf)
+#define LED_RED_PIN    12
+#define LED_GREEN_PIN  13
+#define LED_BLUE_PIN   14
+
 // Initialisierung der seriellen Kommunikation
 TinyGsm modem(Serial1);
 TinyGsmClient client(modem);
 
-void testAT() {
-  Serial.println("Sende AT Befehl...");
-  modem.sendAT("+CSQ"); // Signalqualität abfragen
+// Funktion zum Setzen der LED-Farbe
+void setLEDColor(uint8_t red, uint8_t green, uint8_t blue) {
+  analogWrite(LED_RED_PIN, red);
+  analogWrite(LED_GREEN_PIN, green);
+  analogWrite(LED_BLUE_PIN, blue);
+}
+
+// Funktion zum Testen der Signalstärke
+void testSignalStrength() {
+  Serial.println("Überprüfe Signalstärke...");
+  modem.sendAT("+CSQ");
   delay(1000);
   while (Serial1.available()) {
     String response = Serial1.readStringUntil('\n');
@@ -40,6 +54,7 @@ void testAT() {
   }
 }
 
+// Funktion zum Testen zusätzlicher AT-Befehle
 void testAdditionalATCommands() {
   Serial.println("Sende AT+CREG? (Netzwerkregistrierung)");
   modem.sendAT("+CREG?");
@@ -58,43 +73,78 @@ void testAdditionalATCommands() {
   }
 }
 
+// Funktion zum Durchführen einer HTTP GET Anfrage
+void performHttpRequest() {
+  Serial.println("Starte HTTP GET Anfrage...");
+  if (client.connect("api.ipify.org", 80)) {
+    Serial.println("Verbunden mit api.ipify.org");
+    client.println("GET /?format=json HTTP/1.1");
+    client.println("Host: api.ipify.org");
+    client.println("Connection: close");
+    client.println();
+  } else {
+    Serial.println("Verbindung zu api.ipify.org fehlgeschlagen");
+    setLEDColor(255, 0, 0); // Rot für Fehler
+    return;
+  }
+
+  // Lesen der Antwort
+  while (client.connected()) {
+    while (client.available()) {
+      String line = client.readStringUntil('\n');
+      Serial.println(line);
+    }
+  }
+
+  Serial.println("Verbindung geschlossen");
+  setLEDColor(0, 0, 255); // Blau nach erfolgreicher Anfrage
+}
+
 void setup() {
   // Serielle Monitore starten
   Serial.begin(115200);
   delay(10);
-  
+
   // Initialisierung der Modem-Pins
   pinMode(MODEM_PWRKEY, OUTPUT);
   pinMode(MODEM_RST, OUTPUT);
   pinMode(MODEM_POWER_ON, OUTPUT);
-  
+
+  // Initialisierung der LED-Pins
+  pinMode(LED_RED_PIN, OUTPUT);
+  pinMode(LED_GREEN_PIN, OUTPUT);
+  pinMode(LED_BLUE_PIN, OUTPUT);
+
   // Setzen der Modem-Pins in den Standardzustand
   digitalWrite(MODEM_PWRKEY, LOW);
   digitalWrite(MODEM_RST, HIGH);
   digitalWrite(MODEM_POWER_ON, HIGH);
-  
+
+  // LED ausschalten
+  setLEDColor(0, 0, 0);
+
   // Kurzer Reset des Modems
   digitalWrite(MODEM_RST, LOW);
   delay(100);
   digitalWrite(MODEM_RST, HIGH);
   delay(1000);
-  
+
   // Serielle Verbindung zum Modem starten
   Serial1.begin(MODEM_BAUD_RATE, SERIAL_8N1, MODEM_RX, MODEM_TX);
   delay(3000); // Wartezeit für das Modem zum Starten
-  
+
   Serial.println("Starte das Modem...");
-  
+
   // Modem neustarten
   modem.restart();
   delay(1000);
-  
+
   // Test AT-Befehl
   testAT();
-  
+
   // Zusätzliche AT-Befehle testen
   testAdditionalATCommands();
-  
+
   // Überprüfen, ob SIM entsperrt ist
   if (modem.getSimStatus() != 3) { // 3 bedeutet, SIM ist entsperrt
     Serial.println("SIM ist gesperrt, versuche zu entsperren...");
@@ -102,6 +152,7 @@ void setup() {
       Serial.println("SIM entsperrt");
     } else {
       Serial.println("SIM Entsperrung fehlgeschlagen");
+      setLEDColor(255, 0, 0); // Rot für Fehler
       return;
     }
   } else {
@@ -112,25 +163,42 @@ void setup() {
   Serial.print("Verbinde mit dem Netzwerk...");
   if (!modem.waitForNetwork()) {
     Serial.println("Verbindung zum Netzwerk fehlgeschlagen");
+    setLEDColor(255, 0, 0); // Rot für Fehler
     return;
   }
   Serial.println("Netzwerk verbunden");
-  
+
   // APN konfigurieren und GPRS verbinden
   Serial.print("Verbinde mit APN: ");
   Serial.println(apn);
   if (!modem.gprsConnect(apn, user, pass)) {
     Serial.println("Verbindung zum GPRS-Netzwerk fehlgeschlagen");
+    setLEDColor(255, 0, 0); // Rot für Fehler
     return;
   }
   Serial.println("GPRS verbunden");
-  
+  setLEDColor(0, 255, 0); // Grün für erfolgreiche Verbindung
+
   // IP-Adresse anzeigen
   String ip = modem.getLocalIP();
   Serial.print("IP Adresse: ");
   Serial.println(ip);
+
+  // HTTP GET Anfrage durchführen
+  performHttpRequest();
 }
 
 void loop() {
   // Hier können weitere Aktionen durchgeführt werden
+}
+
+// Funktion zum Testen eines einfachen AT-Befehls
+void testAT() {
+  Serial.println("Sende AT Befehl...");
+  modem.sendAT("+CSQ"); // Signalqualität abfragen
+  delay(1000);
+  while (Serial1.available()) {
+    String response = Serial1.readStringUntil('\n');
+    Serial.println(response);
+  }
 }
