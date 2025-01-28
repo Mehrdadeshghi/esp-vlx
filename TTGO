@@ -1,188 +1,136 @@
-/************************************************************
-   Minimaler Beispielcode für LILYGO® TTGO T-Call (SIM800L)
-   - Sendet den PIN an das Modem
-   - Baut eine GPRS-Verbindung auf (APN = internet.telekom)
-   - Führt einen einfachen HTTP-GET durch
-   - Gibt die Antwort auf dem seriellen Monitor aus
-
-   Benötigt:
-   - TinyGSM-Bibliothek
-   - Arduino Core für ESP32
-************************************************************/
-
-// -----------------------------------------------------------
-// 1) Modemtyp definieren (WICHTIG für TinyGSM)
-// -----------------------------------------------------------
+#define TINY_GSM_DEBUG Serial
+#define TINY_GSM_DEBUG_LEVEL 1
+// Modem-Typ definieren
 #define TINY_GSM_MODEM_SIM800
-
-// -----------------------------------------------------------
-// 2) Bibliotheken einbinden
-// -----------------------------------------------------------
 #include <TinyGsmClient.h>
-#include <HardwareSerial.h>
+#include <Wire.h>
+#include <SPI.h>
 
-// -----------------------------------------------------------
-// 3) PIN, APN & Credentials anpassen
-// -----------------------------------------------------------
-// Bei einer Telekom-SIM kann APN = "internet.telekom" (oder "internet.t-d1.de") sein.
-// Benutzername/Passwort oft leer. Prüfe die Angaben deines Tarifs!
-const char* SIM_PIN   = "8843";              // <-- Deine SIM-PIN eintragen
-const char* APN       = "internet.telekom";  // <-- Telekom-APN ggf. anpassen
-const char* APN_USER  = "";                 // meist leer
-const char* APN_PASS  = "";                 // meist leer
 
-// -----------------------------------------------------------
-// 4) Pins für TTGO T-Call (V1.4) festlegen
-// -----------------------------------------------------------
-#define MODEM_PWRKEY   4
-#define MODEM_POWER_ON 23
-#define MODEM_TX       27
-#define MODEM_RX       26
 
-// Serielle Konsole (Debug)
-#define SerialMon Serial
+// Pin-Definitionen
+#define MODEM_RST       5
+#define MODEM_PWRKEY    4
+#define MODEM_POWER_ON  23
+#define MODEM_TX        27
+#define MODEM_RX        26
+#define I2C_SDA         21
+#define I2C_SCL         22
+#define MODEM_BAUD_RATE 115200  // 115.2 Kb/s Baudrate
 
-// Serielle Schnittstelle für das SIM800L-Modem
-HardwareSerial SerialAT(1);
-TinyGsm        modem(SerialAT);
+// APN Einstellungen für Vodafone
+const char apn[]  = "event.vodafone.de"; // Vodafone APN
+const char user[] = "";
+const char pass[] = "";
 
-// -----------------------------------------------------------
-// Modem einschalten (PWRKEY-Sequenz, etc.)
-// -----------------------------------------------------------
-void modemPowerOn() {
-  pinMode(MODEM_PWRKEY, OUTPUT);
-  pinMode(MODEM_POWER_ON, OUTPUT);
+// SIM-PIN, falls erforderlich (leer lassen, wenn nicht benötigt)
+const char simPIN[] = ""; // Beispiel: "1234"
 
-  // Modul mit Strom versorgen
-  digitalWrite(MODEM_POWER_ON, HIGH);
-  delay(100);
+// Initialisierung der seriellen Kommunikation
+TinyGsm modem(Serial1);
+TinyGsmClient client(modem);
 
-  // PWRKEY kurz auf HIGH -> LOW -> HIGH
-  digitalWrite(MODEM_PWRKEY, HIGH);
+void testAT() {
+  Serial.println("Sende AT Befehl...");
+  modem.sendAT("+CSQ"); // Signalqualität abfragen
   delay(1000);
-  digitalWrite(MODEM_PWRKEY, LOW);
-  delay(1000);
-  digitalWrite(MODEM_PWRKEY, HIGH);
+  while (Serial1.available()) {
+    String response = Serial1.readStringUntil('\n');
+    Serial.println(response);
+  }
 }
 
-// -----------------------------------------------------------
-// setup()
-// -----------------------------------------------------------
-void setup() {
-  // Serielle Schnittstelle für Debug-Meldungen
-  SerialMon.begin(115200);
-  delay(10);
-  SerialMon.println("Starte TTGO T-Call mit SIM800L...");
-
-  // GSM-Modem einschalten
-  modemPowerOn();
-
-  // Seriellen Port fürs Modem initialisieren
-  // Standard-Baudrate beim SIM800L: 115200
-  SerialAT.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
-
-  // Kurz warten, bis das Modem hochgefahren ist
-  delay(3000);
-
-  // Teste, ob das Modem auf AT-Befehle reagiert
-  SerialMon.println("Teste AT-Kommunikation...");
-  if (!modem.testAT()) {
-    SerialMon.println("Keine Antwort vom Modem. Bitte Verkabelung/Baudrate prüfen.");
-    while (true) { /* Endlosschleife */ }
+void testAdditionalATCommands() {
+  Serial.println("Sende AT+CREG? (Netzwerkregistrierung)");
+  modem.sendAT("+CREG?");
+  delay(1000);
+  while (Serial1.available()) {
+    String response = Serial1.readStringUntil('\n');
+    Serial.println(response);
   }
-  SerialMon.println("Modem antwortet auf AT-Befehle.");
 
-  // ---------------------------------------------------------
-  // SIM-PIN senden (falls die SIM-Karte einen aktiven PIN hat)
-  // ---------------------------------------------------------
-  if (SIM_PIN && SIM_PIN[0] != '\0') {
-    SerialMon.print("Sende PIN: ");
-    SerialMon.println(SIM_PIN);
+  Serial.println("Sende AT+CGATT? (GPRS Attachment Status)");
+  modem.sendAT("+CGATT?");
+  delay(1000);
+  while (Serial1.available()) {
+    String response = Serial1.readStringUntil('\n');
+    Serial.println(response);
+  }
+}
 
-    // PIN per AT+CPIN="xxxx" senden
-    modem.sendAT(String("AT+CPIN=\"") + SIM_PIN + "\"");
-    if (modem.waitResponse(10000L) != 1) {
-      SerialMon.println("PIN-Eingabe fehlgeschlagen oder Timeout.");
-      // Hier ggf. Abbruch oder Wiederholung
+void setup() {
+  // Serielle Monitore starten
+  Serial.begin(115200);
+  delay(10);
+  
+  // Initialisierung der Modem-Pins
+  pinMode(MODEM_PWRKEY, OUTPUT);
+  pinMode(MODEM_RST, OUTPUT);
+  pinMode(MODEM_POWER_ON, OUTPUT);
+  
+  // Setzen der Modem-Pins in den Standardzustand
+  digitalWrite(MODEM_PWRKEY, LOW);
+  digitalWrite(MODEM_RST, HIGH);
+  digitalWrite(MODEM_POWER_ON, HIGH);
+  
+  // Kurzer Reset des Modems
+  digitalWrite(MODEM_RST, LOW);
+  delay(100);
+  digitalWrite(MODEM_RST, HIGH);
+  delay(1000);
+  
+  // Serielle Verbindung zum Modem starten
+  Serial1.begin(MODEM_BAUD_RATE, SERIAL_8N1, MODEM_RX, MODEM_TX);
+  delay(3000); // Wartezeit für das Modem zum Starten
+  
+  Serial.println("Starte das Modem...");
+  
+  // Modem neustarten
+  modem.restart();
+  delay(1000);
+  
+  // Test AT-Befehl
+  testAT();
+  
+  // Zusätzliche AT-Befehle testen
+  testAdditionalATCommands();
+  
+  // Überprüfen, ob SIM entsperrt ist
+  if (modem.getSimStatus() != 3) { // 3 bedeutet, SIM ist entsperrt
+    Serial.println("SIM ist gesperrt, versuche zu entsperren...");
+    if (modem.simUnlock(simPIN)) {
+      Serial.println("SIM entsperrt");
     } else {
-      SerialMon.println("PIN akzeptiert. Warte auf SIM-Registrierung...");
-    }
-
-    // Warten, bis SIM 'READY' ist
-    bool simReady = false;
-    for (int i = 0; i < 10; i++) {
-      modem.sendAT("AT+CPIN?");
-      String res = modem.stream.readStringUntil('\n');
-      if (res.indexOf("READY") != -1) {
-        simReady = true;
-        break;
-      }
-      delay(1000);
-    }
-    if (!simReady) {
-      SerialMon.println("SIM wird nicht READY. Prüfe PIN oder SIM-Karte.");
-    } else {
-      SerialMon.println("SIM ist READY.");
+      Serial.println("SIM Entsperrung fehlgeschlagen");
+      return;
     }
   } else {
-    SerialMon.println("Keine PIN nötig oder PIN deaktiviert.");
+    Serial.println("SIM ist bereits entsperrt");
   }
 
-  // ---------------------------------------------------------
-  // GPRS-Verbindung herstellen
-  // ---------------------------------------------------------
-  SerialMon.println("Starte GPRS...");
-  modem.gprsConnect(APN, APN_USER, APN_PASS);
-
-  // Warte, bis GPRS connected ist
-  while (!modem.isGprsConnected()) {
-    SerialMon.print(".");
-    delay(500);
-  }
-  SerialMon.println("\nGPRS verbunden!");
-
-  // ---------------------------------------------------------
-  // IP-Adresse anzeigen (Achtung: IPAddress statt String!)
-  // ---------------------------------------------------------
-  IPAddress ip = modem.localIP();   // -> gibt IPAddress zurück
-  SerialMon.print("Lokale IP: ");
-  SerialMon.println(ip);            // automatische Ausgabe als 192.168.x.x
-
-  // ---------------------------------------------------------
-  // Einfacher HTTP-Request zum Test (HTTP, unverschlüsselt)
-  // ---------------------------------------------------------
-  TinyGsmClient client(modem);
-  const char* testHost = "httpbin.org";
-  const int   testPort = 80;
-
-  SerialMon.println("Verbinde zu httpbin.org...");
-  if (!client.connect(testHost, testPort)) {
-    SerialMon.println("Verbindung fehlgeschlagen!");
+  // Überprüfen, ob das Modem mit dem Netzwerk verbunden ist
+  Serial.print("Verbinde mit dem Netzwerk...");
+  if (!modem.waitForNetwork()) {
+    Serial.println("Verbindung zum Netzwerk fehlgeschlagen");
     return;
   }
-
-  // HTTP-Anfrage (GET)
-  client.print(String("GET /get HTTP/1.1\r\n") +
-               "Host: " + testHost + "\r\n" +
-               "Connection: close\r\n\r\n");
-
-  // Antwort lesen
-  unsigned long timeout = millis();
-  while (client.connected() && (millis() - timeout < 5000)) {
-    while (client.available()) {
-      String line = client.readStringUntil('\n');
-      SerialMon.println(line);
-      timeout = millis();  // Timeout zurücksetzen, wenn Daten eintreffen
-    }
+  Serial.println("Netzwerk verbunden");
+  
+  // APN konfigurieren und GPRS verbinden
+  Serial.print("Verbinde mit APN: ");
+  Serial.println(apn);
+  if (!modem.gprsConnect(apn, user, pass)) {
+    Serial.println("Verbindung zum GPRS-Netzwerk fehlgeschlagen");
+    return;
   }
-  client.stop();
-  SerialMon.println("HTTP-Request beendet.");
+  Serial.println("GPRS verbunden");
+  
+  // IP-Adresse anzeigen
+  String ip = modem.getLocalIP();
+  Serial.print("IP Adresse: ");
+  Serial.println(ip);
 }
 
-// -----------------------------------------------------------
-// loop()
-// -----------------------------------------------------------
 void loop() {
-  // Hauptschleife – ggf. Deep-Sleep, MQTT, weitere Aufgaben...
-  // Nichts mehr zu tun in diesem Beispiel.
+  // Hier können weitere Aktionen durchgeführt werden
 }
