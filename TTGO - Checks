@@ -1,0 +1,245 @@
+/**************************************************************
+ *  Vollständiger Code für ESP32 + SIM800L + Vodafone-Tests
+ *  
+ *  Ablauf:
+ *   1. Modem einschalten (PWRKEY).
+ *   2. Alle Baudraten testen (115200, 9600, 57600, 38400, 19200).
+ *   3. Wenn "AT" => "OK", Baudrate erkannt.
+ *   4. Check Netzwerkregistrierung (AT+CREG?).
+ *   5. Durchlaufe alle Vodafone-APNs ("web.vodafone.de", "event.vodafone.de", "office.vodafone.de").
+ *   6. Pro APN bis zu 3 Versuche:
+ *       - GPRS aktivieren (AT+SAPBR).
+ *       - IP abrufen (AT+CIFSR).
+ *       - Ping "8.8.8.8" prüfen.
+ *   7. Erfolgreiche Verbindung => Abbruch. Sonst Fehlermeldung.
+ **************************************************************/
+
+#include <HardwareSerial.h>
+
+//
+//   Pin-Definitionen anpassen!
+//   ===========================
+//
+#define SIM800_TX         27   // TX (SIM800L) → RX (ESP32 GPIO27 -> Wir BENENNEN den Pin vom ESP32 aus Sicht des SIM800L: SIM800_TX)
+#define SIM800_RX         26   // RX (SIM800L) → TX (ESP32 GPIO26 -> Wir BENENNEN den Pin vom ESP32 aus Sicht des SIM800L: SIM800_RX)
+#define SIM800_PWRKEY     4    // PWRKEY-Pin am SIM800L
+#define SIM800_POWER_ON   23   // Wenn dein Board einen Enable/Power-Pin hat (z.B. auf TTGO T-Call)
+
+// Falls kein extra POWER_ON existiert, kannst du diesen Pin weglassen
+// oder an GND/3V3 lassen, je nach Board-Layout.
+
+HardwareSerial sim800(1);  // Serielle Schnittstelle UART1 für das SIM800L
+
+// Alle Baudraten, die wir ausprobieren
+int baud_rates[] = {115200, 9600, 57600, 38400, 19200};
+int num_baud_rates = sizeof(baud_rates) / sizeof(baud_rates[0]);
+
+// Alle Vodafone-APNs
+const char* vodafone_apns[] = {
+  "web.vodafone.de",
+  "event.vodafone.de",
+  "office.vodafone.de"
+};
+int num_apns = sizeof(vodafone_apns) / sizeof(vodafone_apns[0]);
+
+#define MAX_APN_TRIES 3  // Pro APN max. Versuche
+
+/**************************************************************
+ * powerOnSIM800L()
+ *  Schaltet das SIM800L-Modul über PWRKEY ein.
+ *  Falls dein Board keinen POWER_ON-Pin hat, entferne die Zeilen.
+ **************************************************************/
+void powerOnSIM800L() {
+  Serial.println("🔌 Schalte SIM800L ein...");
+
+  // Pins als Ausgang konfigurieren
+  pinMode(SIM800_POWER_ON, OUTPUT);
+  pinMode(SIM800_PWRKEY, OUTPUT);
+
+  // Modul mit Spannung versorgen
+  digitalWrite(SIM800_POWER_ON, HIGH); 
+  delay(100);
+
+  // PWRKEY 1 Sekunde auf LOW, dann HIGH, um das Modul einzuschalten
+  digitalWrite(SIM800_PWRKEY, LOW);  
+  delay(1000);  
+  digitalWrite(SIM800_PWRKEY, HIGH); 
+  delay(5000);  // Dem Modem Zeit geben, hochzufahren
+}
+
+/**************************************************************
+ * sendATCommand()
+ *  Sendet ein AT-Kommando und liefert die komplette Modem-
+ *  Antwort als String zurück. Verhindert doppeltes Lesen.
+ **************************************************************/
+String sendATCommand(const char* command, int wait_time = 2000) {
+  // Befehl senden
+  sim800.println(command);
+
+  // Warte, bis das Modem reagiert
+  delay(wait_time);
+
+  // Antwort aus dem Puffer holen
+  String response;
+  while (sim800.available()) {
+    response += (char)sim800.read();
+  }
+
+  // Debug-Ausgabe im Serial Monitor
+  Serial.print(">> ");
+  Serial.println(response);
+
+  return response;
+}
+
+/**************************************************************
+ * setupSIM800L()
+ *  Initialisiert die serielle Verbindung zur SIM800L
+ *  mit der übergebenen Baudrate, sendet "AT" und
+ *  prüft auf "OK".
+ **************************************************************/
+bool setupSIM800L(int baud_rate) {
+  // Serielle Verbindung starten
+  sim800.begin(baud_rate, SERIAL_8N1, SIM800_RX, SIM800_TX);
+  delay(3000);
+
+  Serial.printf("🔄 Teste Baudrate: %d\n", baud_rate);
+
+  // "AT" senden, prüfen ob "OK"
+  String response = sendATCommand("AT", 2000);
+
+  if (response.indexOf("OK") >= 0) {
+    Serial.println("✅ Baudrate erkannt!");
+    return true;
+  } else {
+    Serial.println("❌ Baudrate nicht erkannt.");
+    return false;
+  }
+}
+
+/**************************************************************
+ * checkNetworkRegistration()
+ *  Prüft, ob die SIM-Karte im Mobilfunknetz registriert ist.
+ *  Gibt true zurück, wenn +CREG: 0,1 oder 0,5 (roaming).
+ **************************************************************/
+bool checkNetworkRegistration() {
+  Serial.println("🔍 Prüfe Netzregistrierung...");
+  String response = sendATCommand("AT+CREG?", 3000);
+
+  // +CREG: 0,1 => registriert, +CREG: 0,5 => registriert (roaming)
+  if (response.indexOf("+CREG: 0,1") >= 0 || response.indexOf("+CREG: 0,5") >= 0) {
+    Serial.println("✅ SIM ist im Netz registriert!");
+    return true;
+  } else {
+    Serial.println("❌ Keine Netzregistrierung (CREG != 1/5).");
+    return false;
+  }
+}
+
+/**************************************************************
+ * tryAPN()
+ *  Versucht, eine GPRS-Verbindung mit dem angegebenen APN
+ *  aufzubauen. Prüft dann die Verbindung per Ping auf 8.8.8.8.
+ *  Gibt true zurück, wenn erfolgreich.
+ **************************************************************/
+bool tryAPN(const char* apn) {
+  Serial.print("🌐 Teste APN: ");
+  Serial.println(apn);
+
+  // Offene IP-Sessions beenden
+  sendATCommand("AT+CIPSHUT", 3000);
+
+  // GPRS-Bearer konfigurieren
+  sendATCommand("AT+SAPBR=3,1,\"Contype\",\"GPRS\"", 1000);
+
+  // APN-String setzen
+  String apn_command = String("AT+SAPBR=3,1,\"APN\",\"") + apn + "\"";
+  sendATCommand(apn_command.c_str(), 1000);
+
+  // Bearer öffnen
+  sendATCommand("AT+SAPBR=1,1", 3000);
+
+  // Bearer-Status prüfen
+  sendATCommand("AT+SAPBR=2,1", 2000);
+
+  // Verbindung initialisieren
+  sendATCommand("AT+CIICR", 3000);
+
+  // IP-Adresse anzeigen
+  String ipResponse = sendATCommand("AT+CIFSR", 3000);
+  if (ipResponse.indexOf("ERROR") >= 0) {
+    Serial.println("❌ Konnte keine IP beziehen.");
+    return false;
+  }
+
+  // Ping-Test auf 8.8.8.8
+  Serial.println("🌍 Prüfe Internetverbindung (Ping)...");
+  String pingResponse = sendATCommand("AT+PING=\"8.8.8.8\"", 3000);
+
+  // Wenn "ERROR" oder "DEACT", dann kein Netz
+  if (pingResponse.indexOf("ERROR") >= 0 ||
+      pingResponse.indexOf("DEACT") >= 0) {
+    Serial.println("❌ Verbindung fehlgeschlagen.");
+    return false;
+  } else {
+    Serial.println("✅ Internetverbindung erfolgreich!");
+    return true;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n🔄 Starte ESP32...");
+
+  // 1) Modem einschalten
+  powerOnSIM800L();
+
+  // 2) Mehrere Baudraten probieren
+  bool modem_found = false;
+  int working_baud = 0;
+
+  for (int i = 0; i < num_baud_rates; i++) {
+    if (setupSIM800L(baud_rates[i])) {
+      working_baud = baud_rates[i];
+      modem_found = true;
+      break;
+    }
+  }
+
+  if (!modem_found) {
+    Serial.println("❌ Kein Modem gefunden. Überprüfe RX/TX und Stromversorgung.");
+    return;
+  }
+
+  Serial.print("📡 Verbindung mit SIM800L bei Baudrate: ");
+  Serial.println(working_baud);
+
+  // 3) Netzregistrierung checken
+  if (!checkNetworkRegistration()) {
+    Serial.println("⚠️ Netz nicht gefunden. Abbruch.");
+    return;
+  }
+
+  // 4) APNs durchprobieren
+  bool connected = false;
+  for (int i = 0; i < num_apns && !connected; i++) {
+    for (int j = 0; j < MAX_APN_TRIES && !connected; j++) {
+      Serial.printf("🛠️ Versuch %d mit APN '%s'\n", (j + 1), vodafone_apns[i]);
+      connected = tryAPN(vodafone_apns[i]);
+      if (connected) {
+        break;
+      }
+      delay(3000);  // Kleiner Cooldown zwischen den Versuchen
+    }
+  }
+
+  if (connected) {
+    Serial.println("🚀 Erfolgreich mit Vodafone verbunden!");
+  } else {
+    Serial.println("❌ Keine funktionierende Verbindung gefunden!");
+  }
+}
+
+void loop() {
+  // Kein weiterer Code nötig, da wir nur einmal testen.
+}
