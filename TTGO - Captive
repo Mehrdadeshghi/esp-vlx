@@ -1,0 +1,227 @@
+/**************************************************************
+ * GPRS-Verbindung mit TinyGSM + Captive Portal auf ESP32
+ * -------------------------------------------------------
+ * - Baut per SIM800L eine GPRS-Verbindung (Vodafone APN)
+ * - ESP32 erstellt eigenes WLAN (AP) und leitet Anfragen
+ *   immer zu einer Status-Seite (Captive Portal).
+ **************************************************************/
+
+// ============ GPRS-Einstellungen ============
+
+#define TINY_GSM_MODEM_SIM800
+#include <TinyGsmClient.h>
+
+// Pins anpassen:
+#define MODEM_RST       5
+#define MODEM_PWRKEY    4
+#define MODEM_POWER_ON  23
+#define MODEM_TX        27
+#define MODEM_RX        26
+#define MODEM_BAUD_RATE 115200
+
+// APN-Daten für Vodafone
+const char apn[]  = "internet"; // oder "web.vodafone.de", "wap.vodafone.de"
+const char user[] = "";
+const char pass[] = "";
+
+// SIM-PIN (falls nötig)
+const char simPIN[] = ""; // z. B. "1234"
+
+// GPRS-Variablen
+TinyGsm modem(Serial1);
+TinyGsmClient client(modem);
+
+unsigned long lastReconnectAttempt = 0;
+const unsigned long reconnectInterval = 10000; // 10s Intervall
+bool isGprsConnected = false;
+String lastErrorMsg = "";
+String lastIp = "";
+
+// ============ WLAN + Captive Portal ============
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+
+/* 
+  Captive Portal:
+  - Der ESP32 erstellt einen Access Point
+  - DNS-Server leitet alle Domains auf unsere IP
+  - WebServer zeigt Status-Seite
+*/
+
+// Netzwerk-Konfiguration
+const char* AP_SSID = "ESP_GPRS_HOTSPOT";
+const char* AP_PASS = "12345678"; // mind. 8 Zeichen
+
+// DNS / Webserver
+#define DNS_PORT 53
+DNSServer dnsServer;
+WebServer server(80);
+
+// Hilfsfunktion: Status-Seite generieren
+String makeHtmlPage() {
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<meta charset='UTF-8'/><title>GPRS Status</title>";
+  html += "<style>body { font-family: sans-serif; }</style></head><body>";
+  html += "<h1>GPRS Status</h1><hr/>";
+
+  // GPRS-Status
+  if (isGprsConnected) {
+    html += "<p><strong>Verbunden</strong> mit GPRS.</p>";
+    html += "<p>Zugeteilte IP: " + lastIp + "</p>";
+  } else {
+    html += "<p><strong>Nicht verbunden</strong> mit GPRS.</p>";
+    if (lastErrorMsg.length() > 0) {
+      html += "<p style='color:red;'>Letzte Fehlermeldung: " + lastErrorMsg + "</p>";
+    }
+  }
+
+  // Optional: Signalstärke abfragen
+  int16_t signalQ = modem.getSignalQuality();
+  html += "<p>Signalstärke (CSQ): " + String(signalQ) + "</p>";
+
+  html += "<hr/><p>Versucht alle 10s neu eine Verbindung aufzubauen, sofern nicht verbunden.</p>";
+  html += "</body></html>";
+  return html;
+}
+
+// Callback: Hauptseite
+void handleRoot() {
+  String html = makeHtmlPage();
+  server.send(200, "text/html", html);
+}
+
+// Callback: Fallback - leitet alle Pfade zur Root
+void handleNotFound() {
+  server.sendHeader("Location", String("http://") + WiFi.softAPIP().toString(), true);
+  server.send(302, "text/plain", "");
+}
+
+/**************************************************************
+ * SETUP
+ **************************************************************/
+void setup() {
+  Serial.begin(115200);
+  delay(10);
+
+  // ========== MODEM-Pins ==========
+  pinMode(MODEM_PWRKEY, OUTPUT);
+  pinMode(MODEM_RST, OUTPUT);
+  pinMode(MODEM_POWER_ON, OUTPUT);
+  digitalWrite(MODEM_PWRKEY, LOW);
+  digitalWrite(MODEM_RST, HIGH);
+  digitalWrite(MODEM_POWER_ON, HIGH);
+
+  // Kurzer Reset
+  digitalWrite(MODEM_RST, LOW);
+  delay(100);
+  digitalWrite(MODEM_RST, HIGH);
+  delay(1000);
+
+  // Serielle Verbindung zum Modem
+  Serial1.begin(MODEM_BAUD_RATE, SERIAL_8N1, MODEM_RX, MODEM_TX);
+  delay(3000);
+
+  Serial.println("Modem wird neu gestartet...");
+  modem.restart();
+
+  // SIM-Karte prüfen/entsperren
+  if (modem.getSimStatus() != 3) {
+    Serial.println("SIM ist gesperrt. Versuche zu entsperren...");
+    if (modem.simUnlock(simPIN)) {
+      Serial.println("SIM entsperrt.");
+    } else {
+      Serial.println("Konnte SIM nicht entsperren!");
+    }
+  }
+
+  // ========== WLAN AP einschalten ==========
+  Serial.println("Starte Access Point...");
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASS);
+  delay(500);
+
+  IPAddress myIP = WiFi.softAPIP();
+  Serial.print("AP IP: ");
+  Serial.println(myIP);
+
+  // ========== DNS Server fuer Captive Portal ==========
+  dnsServer.start(DNS_PORT, "*", myIP);
+
+  // ========== Webserver-Routen ==========
+  server.onNotFound(handleNotFound);  // alles umleiten
+  server.on("/", handleRoot);         // Startseite
+  server.begin();
+  Serial.println("Webserver gestartet.");
+
+  Serial.println("Setup abgeschlossen. Starte ersten GPRS-Verbindungsversuch...");
+}
+
+/**************************************************************
+ * LOOP
+ **************************************************************/
+void loop() {
+  // DNS abarbeiten
+  dnsServer.processNextRequest();
+
+  // HTTP Server abarbeiten
+  server.handleClient();
+
+  // GPRS Check
+  if (modem.isGprsConnected()) {
+    if (!isGprsConnected) {
+      Serial.println("GPRS-Verbindung jetzt aktiv!");
+      isGprsConnected = true;
+      lastErrorMsg = "";
+      lastIp = modem.getLocalIP();
+      Serial.print("Zugewiesene IP: ");
+      Serial.println(lastIp);
+    }
+  } else {
+    if (isGprsConnected) {
+      Serial.println("GPRS-Verbindung verloren!");
+      isGprsConnected = false;
+    }
+    unsigned long currentMillis = millis();
+    if (currentMillis - lastReconnectAttempt > reconnectInterval) {
+      lastReconnectAttempt = currentMillis;
+      Serial.println("Versuche, GPRS zu verbinden...");
+      tryGprsConnect();
+    }
+  }
+
+  // ... weitere Aktionen nach Bedarf
+}
+
+/**************************************************************
+ * Versucht, GPRS zu verbinden
+ **************************************************************/
+void tryGprsConnect() {
+  // Prüfen, ob Modem im Netz ist
+  if (!modem.waitForNetwork(10000)) {
+    Serial.println("Netzwerk nicht erreichbar. Versuche es später erneut.");
+    lastErrorMsg = "Netzwerk nicht erreichbar.";
+    return;
+  } else {
+    Serial.println("Im Netz registriert.");
+  }
+
+  // APN
+  Serial.print("Verbinde mit APN: ");
+  Serial.println(apn);
+
+  // GPRS
+  if (!modem.gprsConnect(apn, user, pass)) {
+    Serial.println("GPRS-Verbindung fehlgeschlagen.");
+    lastErrorMsg = "GPRS-Verbindung fehlgeschlagen.";
+  } else {
+    Serial.println("GPRS verbunden!");
+    lastErrorMsg = "";
+  }
+
+  // IP ausgeben
+  lastIp = modem.getLocalIP();
+  Serial.print("IP: ");
+  Serial.println(lastIp);
+}
