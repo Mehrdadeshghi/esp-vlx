@@ -1,7 +1,7 @@
 /******************************************************
  * TTGO T-Call (SAPBR-only) – Briefkasten-Logic mit VL53L0X,
  * PIR-Sensor und SIM800L.
- * Deep-Sleep für SIM800L integriert
+ * Optimierter Code: SIM800L nur bei Ereignis-Übertragung aktiv
  * Wake-up: EXT0 (PIR, RISING) & Timer (15 min Keep-Alive)
  *
  ******************************************************/
@@ -57,7 +57,7 @@ HardwareSerial sim800(1);
 //
 // ----- Vorwärtsdeklarationen globaler Funktionen ----------------
 void powerOnSIM800L();
-void powerOffSIM800L(); // Neue Funktion zum Abschalten des SIM800L
+void powerOffSIM800L();
 void sendDeviceInfo();
 void sendCalibrationData();
 void sendLetterEvent(int distance);
@@ -67,7 +67,7 @@ void configureDeepSleep();
 bool isResetButtonPressed();
 String getLocalMacAddress();
 void calibrateVL53L0X();
-void measureForFiveSeconds();
+bool measureForFiveSeconds(); // Geändert: Rückgabewert hinzugefügt (true wenn Ereignis, false wenn nicht)
 
 // Zusätzlich: Prüffunktion (Double-Check), ob der PIR-Pin x ms stabil HIGH ist
 bool checkPirStable(unsigned long stableTimeMs) {
@@ -322,12 +322,15 @@ void calibrateVL53L0X() {
   }
 }
 
-void measureForFiveSeconds() {
+// Geändert: Rückgabewert hinzugefügt (true wenn Ereignis, false wenn nicht)
+bool measureForFiveSeconds() {
   Serial.println("[MEASURE] Starte 5-Sekunden-Messung...");
+  Serial.println("[MEASURE] Initialisiere VL53L0X..."); // Debug-Ausgabe hinzugefügt
   if (!lox.begin()) {
     Serial.println("[ERROR] VL53L0X konnte nicht initialisiert werden!");
-    return;
+    return false; // Fehlerfall: Kein Ereignis
   }
+    Serial.println("[MEASURE] VL53L0X Initialisierung erfolgreich!"); // Debug-Ausgabe hinzugefügt
   lox.setMeasurementTimingBudgetMicroSeconds(20000);
   unsigned long startTime = millis();
   std::vector<int> distanceBuffer;
@@ -347,7 +350,7 @@ void measureForFiveSeconds() {
   }
   if (distanceBuffer.empty()) {
     Serial.println("[MEAS] Keine gültigen Messwerte.");
-    return;
+    return false; // Kein Ereignis, da keine gültigen Messwerte
   }
   int minValue = *std::min_element(distanceBuffer.begin(), distanceBuffer.end());
   int maxValue = *std::max_element(distanceBuffer.begin(), distanceBuffer.end());
@@ -357,12 +360,17 @@ void measureForFiveSeconds() {
   bool kastenGeoeffnet = (maxValue > maxDistance);
   if (briefErkannt) {
     Serial.printf("[EVENT] Brief erkannt (minDist=%d)\n", minValue);
-    sendLetterEvent(minValue);
+    preferences.putInt("minValue", minValue); // Speichere minValue und maxValue für späteren Zugriff
+    preferences.putInt("maxValue", maxValue);
+    return true; // Brief erkannt -> Ereignis
   } else if (kastenGeoeffnet) {
     Serial.printf("[EVENT] Tür geöffnet (maxDist=%d)\n", maxValue);
-    sendDoorEvent(maxValue);
+    preferences.putInt("minValue", maxValue);
+    preferences.putInt("maxValue", maxValue);
+    return true; // Tür geöffnet -> Ereignis
   } else {
     Serial.println("[INFO] Kein Ereignis erkannt.");
+    return false; // Kein Ereignis
   }
 }
 
@@ -417,7 +425,7 @@ void sendKeepAlive() {
 void configureDeepSleep() {
   Serial.println("[SLEEP] -> configureDeepSleep()");
   // Schalte SIM800L aus, bevor ESP32 in Deep Sleep geht
-  powerOffSIM800L(); // NEU: SIM800L ausschalten
+  powerOffSIM800L();
   // RTC-Konfiguration für den PIR-Pin
   rtc_gpio_init((gpio_num_t)PIR_PIN);
   rtc_gpio_set_direction((gpio_num_t)PIR_PIN, RTC_GPIO_MODE_INPUT_ONLY);
@@ -427,11 +435,11 @@ void configureDeepSleep() {
   esp_sleep_enable_ext0_wakeup((gpio_num_t)PIR_PIN, 1);
   // Timer-Wake-up (15 Minuten)
   esp_sleep_enable_timer_wakeup((uint64_t)keepAliveInterval * 1000ULL);
-  Serial.println("[SLEEP] Vor esp_deep_sleep_start()"); // DEBUG-AUSGABE
-  delay(5000); // Verzögerung vor Deep Sleep beibehalten für Debugging
+  Serial.println("[SLEEP] Vor esp_deep_sleep_start()");
+  delay(5000);
   Serial.println("[SLEEP] Jetzt Deep Sleep!");
   esp_deep_sleep_start();
-  Serial.println("[SLEEP] Nach esp_deep_sleep_start() - sollte NICHT erreicht werden!"); // DEBUG-AUSGABE - Sollte nicht erscheinen!
+  Serial.println("[SLEEP] Nach esp_deep_sleep_start() - sollte NICHT erreicht werden!");
 }
 
 bool isResetButtonPressed() {
@@ -463,7 +471,7 @@ String getLocalMacAddress() {
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println("\n=== TTGO T-Call (SAPBR-only) - EXT0 PIR Wake + Double-Check - SIM800L DEEPSLEEP ==="); // Hinweis auf SIM800L Deep Sleep
+  Serial.println("\n=== TTGO T-Call (SAPBR-only) - EXT0 PIR Wake + Double-Check - OPTIMIERTER CODE ==="); // Hinweis auf optimierten Code
 
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
@@ -473,15 +481,6 @@ void setup() {
 
   preferences.begin("briefkasten", false);
 
-  // SIM800L initialisieren
-  powerOnSIM800L(); // Stelle sicher, dass SIM800L beim Start immer eingeschaltet wird
-  if (!gprs.initModem()) {
-    Serial.println("[ERROR] Modem-Initialisierung fehlgeschlagen.");
-    // Im Fehlerfall: Was soll passieren? Evtl. Deep Sleep ohne SIM-Funktion?
-    // Für Testzwecke hier erstmal Abbruch:
-    while(1); // Endlosschleife, um Fehler zu signalisieren
-  }
-  delay(2000);
 
   // Prüfe, ob bereits eine MAC-Adresse gespeichert ist
   String storedMac = preferences.getString("mac_address", "");
@@ -492,20 +491,6 @@ void setup() {
   } else {
     Serial.println("[INFO] MAC/ID bereits vorhanden: " + storedMac);
   }
-
-  // Debug: Signalstärke und Netz-Status
-  Serial.println("[DEBUG] Überprüfe Signalstärke (CSQ):");
-  String csq = gprs.debugSendAT("AT+CSQ", 2000);
-  Serial.println(csq);
-  Serial.println("[DEBUG] Überprüfe Netzregistrierung (CREG):");
-  String creg = gprs.debugSendAT("AT+CREG?", 2000);
-  Serial.println(creg);
-  Serial.println("[DEBUG] Überprüfe GPRS-Registrierung (CGREG):");
-  String cgreg = gprs.debugSendAT("AT+CGREG?", 2000);
-  Serial.println(cgreg);
-  Serial.println("[DEBUG] Überprüfe SIM-Status (CPIN):");
-  String cpin = gprs.debugSendAT("AT+CPIN?", 2000);
-  Serial.println(cpin);
 
   // Ermitteln des Wake-up-Grunds
   esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
@@ -531,15 +516,40 @@ void setup() {
       Serial.println("[ERROR] Keine Kalibrierung! Starte Kalibrierung...");
       calibrateVL53L0X();
     }
-    measureForFiveSeconds();
-    configureDeepSleep();
+    // **NEU: Messe zuerst, SIM800L noch AUS**
+    bool eventDetected = measureForFiveSeconds(); // Messe und prüfe auf Ereignis
+    if (eventDetected) {
+      Serial.println("[INFO] Ereignis erkannt, schalte SIM800L ein und sende Daten...");
+      powerOnSIM800L(); // **SIM800L nur einschalten, wenn Ereignis erkannt!**
+      if (!gprs.initModem()) { // Initialisiere Modem erneut (ggf. nicht nötig, je nach Stromverbrauch im OFF-Zustand)
+        Serial.println("[ERROR] Modem-Initialisierung fehlgeschlagen nach PIR-Wakeup!");
+        // Fehlerbehandlung hier erweitern, z.B. Ereignis lokal speichern und später senden
+      } else {
+        int minValue = preferences.getInt("minValue", 0); // Annahme: minValue und maxValue werden in measureForFiveSeconds() gesetzt, falls Brief/Tür erkannt
+        int maxValue = preferences.getInt("maxValue", 0);
+        if (preferences.getInt("minValue", 0) < minDistance) { // Korrektur: Verwende gespeicherte Werte aus Preferences
+          sendLetterEvent(preferences.getInt("minValue", 0));
+        } else if (preferences.getInt("maxValue", 0) > maxDistance) { // Korrektur: Verwende gespeicherte Werte aus Preferences
+          sendDoorEvent(preferences.getInt("maxValue", 0));
+        }
+      }
+    } else {
+      Serial.println("[INFO] Kein Ereignis nach PIR-Wakeup.");
+    }
+    configureDeepSleep(); // Gehe in Deep Sleep (SIM800L wird in configureDeepSleep() ausgeschaltet)
 
   } else if (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER) {
     Serial.println("============================================");
     Serial.println("[WAKEUP] Durch Timer (Keep-Alive) aufgewacht!");
     delay(2000);
-    sendKeepAlive();
-    configureDeepSleep();
+    powerOnSIM800L(); // SIM800L für Keep-Alive einschalten
+    if (!gprs.initModem()) {
+      Serial.println("[ERROR] Modem-Initialisierung fehlgeschlagen für Keep-Alive!");
+      // Fehlerbehandlung hier erweitern
+    } else {
+      sendKeepAlive();
+    }
+    configureDeepSleep(); // Gehe in Deep Sleep (SIM800L wird in configureDeepSleep() ausgeschaltet)
 
   } else {
     Serial.println("============================================");
@@ -551,6 +561,11 @@ void setup() {
     }
     String macAddress = preferences.getString("mac_address", "Unbekannt");
     Serial.println("[INFO] MAC/ID: " + macAddress);
+    powerOnSIM800L(); // SIM800L einschalten für DeviceInfo und Calibration
+    if (!gprs.initModem()) {
+      Serial.println("[ERROR] Modem-Initialisierung fehlgeschlagen.");
+      while(1); // Endlosschleife, um Fehler zu signalisieren
+    }
     sendDeviceInfo();
     Serial.println("[INFO] Starte Kalibrierung in 3s...");
     delay(3000);
