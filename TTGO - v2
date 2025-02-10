@@ -4,6 +4,7 @@
  * Optimierter Code: SIM800L nur bei Ereignis-Übertragung aktiv
  * Wake-up: EXT0 (PIR, RISING) & Timer (15 min Keep-Alive)
  *
+ * VERSION OHNE PIR-SIGNAL DOUBLE-CHECK
  ******************************************************/
 
 #include <HardwareSerial.h>
@@ -69,18 +70,6 @@ String getLocalMacAddress();
 void calibrateVL53L0X();
 bool measureForFiveSeconds(); // Geändert: Rückgabewert hinzugefügt (true wenn Ereignis, false wenn nicht)
 
-// Zusätzlich: Prüffunktion (Double-Check), ob der PIR-Pin x ms stabil HIGH ist
-bool checkPirStable(unsigned long stableTimeMs) {
-  unsigned long start = millis();
-  while (millis() - start < stableTimeMs) {
-    if (digitalRead(PIR_PIN) == LOW) {
-      // Sobald der Pin LOW wird, war es nur ein kurzer Spike
-      return false;
-    }
-    delay(10);
-  }
-  return true;  // Der Pin blieb die gesamte Zeit HIGH
-}
 
 //
 // -------------------------------------------------------------
@@ -325,12 +314,10 @@ void calibrateVL53L0X() {
 // Geändert: Rückgabewert hinzugefügt (true wenn Ereignis, false wenn nicht)
 bool measureForFiveSeconds() {
   Serial.println("[MEASURE] Starte 5-Sekunden-Messung...");
-  Serial.println("[MEASURE] Initialisiere VL53L0X..."); // Debug-Ausgabe hinzugefügt
   if (!lox.begin()) {
     Serial.println("[ERROR] VL53L0X konnte nicht initialisiert werden!");
     return false; // Fehlerfall: Kein Ereignis
   }
-    Serial.println("[MEASURE] VL53L0X Initialisierung erfolgreich!"); // Debug-Ausgabe hinzugefügt
   lox.setMeasurementTimingBudgetMicroSeconds(20000);
   unsigned long startTime = millis();
   std::vector<int> distanceBuffer;
@@ -365,7 +352,7 @@ bool measureForFiveSeconds() {
     return true; // Brief erkannt -> Ereignis
   } else if (kastenGeoeffnet) {
     Serial.printf("[EVENT] Tür geöffnet (maxDist=%d)\n", maxValue);
-    preferences.putInt("minValue", maxValue);
+    preferences.putInt("minValue", minValue);
     preferences.putInt("maxValue", maxValue);
     return true; // Tür geöffnet -> Ereignis
   } else {
@@ -471,7 +458,7 @@ String getLocalMacAddress() {
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println("\n=== TTGO T-Call (SAPBR-only) - EXT0 PIR Wake + Double-Check - OPTIMIERTER CODE ==="); // Hinweis auf optimierten Code
+  Serial.println("\n=== TTGO T-Call (SAPBR-only) - EXT0 PIR Wake - OPTIMIERTER CODE (OHNE DOUBLE-CHECK) ==="); // Hinweis auf optimierten Code
 
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
@@ -499,7 +486,6 @@ void setup() {
   if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0) {
     Serial.println("============================================");
     Serial.println("[WAKEUP] Durch PIR (EXT0) aufgewacht!");
-    // Double-Check: Prüfe 1000 ms, ob PIR-Pin stabil HIGH bleibt
 
     // Lade Kalibrierungsdaten
     minDistance = preferences.getInt("minDistance", 0);
@@ -571,3 +557,6 @@ void setup() {
 void loop() {
   // Da der ESP32 in den Deep Sleep geht, wird loop() normalerweise nie erreicht.
 }
+
+// --- Entfernte Funktion ---
+// bool checkPirStable(unsigned long stableTimeMs) { ... }
