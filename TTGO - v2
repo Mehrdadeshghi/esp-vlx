@@ -500,14 +500,7 @@ void setup() {
     Serial.println("============================================");
     Serial.println("[WAKEUP] Durch PIR (EXT0) aufgewacht!");
     // Double-Check: Prüfe 1000 ms, ob PIR-Pin stabil HIGH bleibt
-    bool stableHigh = checkPirStable(1000);
-    if (!stableHigh) {
-      Serial.println("[INFO] Nur ein kurzer Spike, zurück in Deep Sleep...");
-      configureDeepSleep();
-      return;
-    } else {
-      Serial.println("[INFO] PIR-Signal stabil HIGH bestätigt."); // Debug-Ausgabe für Double-Check
-    }
+
     // Lade Kalibrierungsdaten
     minDistance = preferences.getInt("minDistance", 0);
     maxDistance = preferences.getInt("maxDistance", 0);
