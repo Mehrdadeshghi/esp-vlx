@@ -5,6 +5,7 @@
  * Wake-up: EXT0 (PIR, RISING) & Timer (15 min Keep-Alive)
  *
  * VERSION OHNE PIR-SIGNAL DOUBLE-CHECK
+ * VERSION MIT TÜRKONTROLLE VOR BRIEF-ERKENNUNG
  ******************************************************/
 
 #include <HardwareSerial.h>
@@ -68,8 +69,7 @@ void configureDeepSleep();
 bool isResetButtonPressed();
 String getLocalMacAddress();
 void calibrateVL53L0X();
-bool measureForFiveSeconds(); // Geändert: Rückgabewert hinzugefügt (true wenn Ereignis, false wenn nicht)
-
+String measureForFiveSeconds(); // Geändert: Rückgabewert ist jetzt String: "door_opened", "letter_detected", "no_event"
 
 //
 // -------------------------------------------------------------
@@ -230,7 +230,7 @@ private:
     bool success = readUntil("+HTTPACTION: 1,", 20000, actionResp);
     if (success) {
       int statusCode = actionResp.substring(actionResp.indexOf("+HTTPACTION: 1,") + 14,
-                          actionResp.indexOf(",", actionResp.indexOf("+HTTPACTION: 1,") + 14)).toInt();
+                                          actionResp.indexOf(",", actionResp.indexOf("+HTTPACTION: 1,") + 14)).toInt();
       if (statusCode == 200 || statusCode == 201) {
         Serial.printf("[HTTP] ✅ HTTP-POST erfolgreich! (Status %d)\n", statusCode);
       } else {
@@ -311,12 +311,12 @@ void calibrateVL53L0X() {
   }
 }
 
-// Geändert: Rückgabewert hinzugefügt (true wenn Ereignis, false wenn nicht)
-bool measureForFiveSeconds() {
+// Geändert: Rückgabewert ist jetzt String: "door_opened", "letter_detected", "no_event"
+String measureForFiveSeconds() {
   Serial.println("[MEASURE] Starte 5-Sekunden-Messung...");
   if (!lox.begin()) {
     Serial.println("[ERROR] VL53L0X konnte nicht initialisiert werden!");
-    return false; // Fehlerfall: Kein Ereignis
+    return "no_event"; // Fehlerfall: Kein Ereignis
   }
   lox.setMeasurementTimingBudgetMicroSeconds(20000);
   unsigned long startTime = millis();
@@ -337,27 +337,26 @@ bool measureForFiveSeconds() {
   }
   if (distanceBuffer.empty()) {
     Serial.println("[MEAS] Keine gültigen Messwerte.");
-    return false; // Kein Ereignis, da keine gültigen Messwerte
+    return "no_event"; // Kein Ereignis, da keine gültigen Messwerte
   }
   int minValue = *std::min_element(distanceBuffer.begin(), distanceBuffer.end());
   int maxValue = *std::max_element(distanceBuffer.begin(), distanceBuffer.end());
   int averageValue = std::accumulate(distanceBuffer.begin(), distanceBuffer.end(), 0) / (int)distanceBuffer.size();
   Serial.printf("[ANALYSE] Min: %d, Max: %d, Avg: %d\n", minValue, maxValue, averageValue);
-  bool briefErkannt = (minValue < minDistance);
-  bool kastenGeoeffnet = (maxValue > maxDistance);
-  if (briefErkannt) {
-    Serial.printf("[EVENT] Brief erkannt (minDist=%d)\n", minValue);
-    preferences.putInt("minValue", minValue); // Speichere minValue und maxValue für späteren Zugriff
-    preferences.putInt("maxValue", maxValue);
-    return true; // Brief erkannt -> Ereignis
-  } else if (kastenGeoeffnet) {
+
+  if (maxValue > maxDistance) {
     Serial.printf("[EVENT] Tür geöffnet (maxDist=%d)\n", maxValue);
     preferences.putInt("minValue", minValue);
     preferences.putInt("maxValue", maxValue);
-    return true; // Tür geöffnet -> Ereignis
+    return "door_opened"; // Tür geöffnet -> Ereignis
+  } else if (minValue < minDistance) {
+    Serial.printf("[EVENT] Brief erkannt (minDist=%d)\n", minValue);
+    preferences.putInt("minValue", minValue); // Speichere minValue und maxValue für späteren Zugriff
+    preferences.putInt("maxValue", maxValue);
+    return "letter_detected"; // Brief erkannt -> Ereignis
   } else {
     Serial.println("[INFO] Kein Ereignis erkannt.");
-    return false; // Kein Ereignis
+    return "no_event"; // Kein Ereignis
   }
 }
 
@@ -365,7 +364,7 @@ void sendDeviceInfo() {
   Serial.println("[DEBUG] -> sendDeviceInfo()");
   String macAddress = preferences.getString("mac_address", "Unbekannt");
   String payload = String("{\"mac_address\":\"") + macAddress +
-                    "\",\"firmware_version\":\"1.0.0\"}";
+                     "\",\"firmware_version\":\"1.0.0\"}";
   gprs.sendHttpPOST(registrationServerUrl, payload);
 }
 
@@ -373,8 +372,8 @@ void sendCalibrationData() {
   Serial.println("[DEBUG] -> sendCalibrationData()");
   String macAddress = preferences.getString("mac_address", "Unbekannt");
   String payload = "{\"mac_address\":\"" + macAddress +
-                    "\",\"min_distance\":" + String(minDistance) +
-                    ",\"max_distance\":" + String(maxDistance) + "}";
+                     "\",\"min_distance\":" + String(minDistance) +
+                     ",\"max_distance\":" + String(maxDistance) + "}";
   gprs.sendHttpPOST(calibrationServerUrl, payload);
 }
 
@@ -382,7 +381,7 @@ void sendLetterEvent(int distance) {
   Serial.println("[DEBUG] -> sendLetterEvent()");
   String macAddress = preferences.getString("mac_address", "Unbekannt");
   String payload = String("{\"mac_address\":\"") + macAddress +
-                    "\",\"event\":\"letter_detected\",\"distance\":" + String(distance) + "}";
+                     "\",\"event\":\"letter_detected\",\"distance\":" + String(distance) + "}";
   gprs.sendHttpPOST(letterServerUrl, payload);
 }
 
@@ -390,7 +389,7 @@ void sendDoorEvent(int distance) {
   Serial.println("[DEBUG] -> sendDoorEvent()");
   String macAddress = preferences.getString("mac_address", "Unbekannt");
   String payload = String("{\"mac_address\":\"") + macAddress +
-                    "\",\"event\":\"door_opened\",\"distance\":" + String(distance) + "}";
+                     "\",\"event\":\"door_opened\",\"distance\":" + String(distance) + "}";
   gprs.sendHttpPOST(doorServerUrl, payload);
 }
 
@@ -459,6 +458,7 @@ void setup() {
   Serial.begin(115200);
   delay(200);
   Serial.println("\n=== TTGO T-Call (SAPBR-only) - EXT0 PIR Wake - OPTIMIERTER CODE (OHNE DOUBLE-CHECK) ==="); // Hinweis auf optimierten Code
+  Serial.println("=== VERSION MIT TÜRKONTROLLE VOR BRIEF-ERKENNUNG ==="); // Hinweis auf neue Logik
 
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
@@ -467,7 +467,6 @@ void setup() {
   pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
 
   preferences.begin("briefkasten", false);
-
 
   // Prüfe, ob bereits eine MAC-Adresse gespeichert ist
   String storedMac = preferences.getString("mac_address", "");
@@ -496,21 +495,24 @@ void setup() {
       calibrateVL53L0X();
     }
     // **NEU: Messe zuerst, SIM800L noch AUS**
-    bool eventDetected = measureForFiveSeconds(); // Messe und prüfe auf Ereignis
-    if (eventDetected) {
-      Serial.println("[INFO] Ereignis erkannt, schalte SIM800L ein und sende Daten...");
+    String eventType = measureForFiveSeconds(); // Messe und prüfe auf Ereignis
+    if (eventType == "door_opened") {
+      Serial.println("[INFO] Tür geöffnet erkannt, schalte SIM800L ein und sende Door-Event...");
       powerOnSIM800L(); // **SIM800L nur einschalten, wenn Ereignis erkannt!**
       if (!gprs.initModem()) { // Initialisiere Modem erneut (ggf. nicht nötig, je nach Stromverbrauch im OFF-Zustand)
         Serial.println("[ERROR] Modem-Initialisierung fehlgeschlagen nach PIR-Wakeup!");
         // Fehlerbehandlung hier erweitern, z.B. Ereignis lokal speichern und später senden
       } else {
-        int minValue = preferences.getInt("minValue", 0); // Annahme: minValue und maxValue werden in measureForFiveSeconds() gesetzt, falls Brief/Tür erkannt
-        int maxValue = preferences.getInt("maxValue", 0);
-        if (preferences.getInt("minValue", 0) < minDistance) { // Korrektur: Verwende gespeicherte Werte aus Preferences
-          sendLetterEvent(preferences.getInt("minValue", 0));
-        } else if (preferences.getInt("maxValue", 0) > maxDistance) { // Korrektur: Verwende gespeicherte Werte aus Preferences
-          sendDoorEvent(preferences.getInt("maxValue", 0));
-        }
+        sendDoorEvent(preferences.getInt("maxValue", 0)); // Tür-Event senden mit maxDistance
+      }
+    } else if (eventType == "letter_detected") {
+      Serial.println("[INFO] Brief erkannt, schalte SIM800L ein und sende Letter-Event...");
+      powerOnSIM800L(); // **SIM800L nur einschalten, wenn Ereignis erkannt!**
+      if (!gprs.initModem()) { // Initialisiere Modem erneut (ggf. nicht nötig, je nach Stromverbrauch im OFF-Zustand)
+        Serial.println("[ERROR] Modem-Initialisierung fehlgeschlagen nach PIR-Wakeup!");
+        // Fehlerbehandlung hier erweitern, z.B. Ereignis lokal speichern und später senden
+      } else {
+        sendLetterEvent(preferences.getInt("minValue", 0)); // Brief-Event senden mit minDistance
       }
     } else {
       Serial.println("[INFO] Kein Ereignis nach PIR-Wakeup.");
@@ -557,6 +559,3 @@ void setup() {
 void loop() {
   // Da der ESP32 in den Deep Sleep geht, wird loop() normalerweise nie erreicht.
 }
-
-// --- Entfernte Funktion ---
-// bool checkPirStable(unsigned long stableTimeMs) { ... }
