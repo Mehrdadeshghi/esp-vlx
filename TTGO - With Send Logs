@@ -1,0 +1,625 @@
+/******************************************************
+ * TTGO T-Call (SAPBR-only) – Briefkasten-Logic mit VL53L0X,
+ * PIR-Sensor und SIM800L.
+ * Optimierter Code: SIM800L nur bei Ereignis-Übertragung aktiv
+ * Wake-up: EXT0 (PIR, RISING) & Timer (15 min Keep-Alive)
+ *
+ * VERSION OHNE PIR-SIGNAL DOUBLE-CHECK
+ * VERSION MIT TÜRKONTROLLE VOR BRIEF-ERKENNUNG
+ * ERWEITERUNG: Logs sammeln und vor Deep-Sleep an den Server senden
+ ******************************************************/
+
+#include <HardwareSerial.h>
+#include <Wire.h>
+#include <Adafruit_VL53L0X.h>
+#include <Preferences.h>
+#include <vector>
+#include <numeric>
+#include <esp_sleep.h>
+#include "driver/rtc_io.h"
+
+// ====================== SIM800L-Pins (TTGO T-Call V1.4) ======================
+#define MODEM_TX          27   // TXD des SIM800L → ESP32 GPIO27
+#define MODEM_RX          26   // RXD des SIM800L → ESP32 GPIO26
+#define MODEM_PWRKEY      4    // PWRKEY-Pin des SIM800L
+#define MODEM_POWER_ON    23   // Power-Enable-Pin des SIM800L
+#define LED_PIN           13   // LED auf dem Board
+
+// ====================== Weitere Hardware-Pins ==============================
+#define PIR_PIN           33   // PIR-Sensor (RTC-fähiger Pin!)
+#define RESET_BUTTON_PIN  0    // Reset-Taster
+
+// ====================== SIM800L-Einstellungen ==============================
+#define MODEM_BAUD        115200
+const char* APN           = "web.vodafone.de";
+const char* APN_USER      = "";   // falls erforderlich
+const char* APN_PASS      = "";   // falls erforderlich
+
+// ====================== Server-Endpunkte ===================================
+const char* registrationServerUrl = "http://45.195.250.247:8002/device";
+const char* calibrationServerUrl  = "http://45.195.250.247:8002/calibration";
+const char* letterServerUrl       = "http://45.195.250.247:8002/letter";
+const char* doorServerUrl         = "http://45.195.250.247:8002/door";
+const char* keepaliveServerUrl    = "http://45.195.250.247:8002/keepalive";
+const char* logsServerUrl         = "http://45.195.250.247:8002/logs";  // NEUER ENDPOINT FÜR LOGS
+
+// ====================== Globale Variablen =================================
+Preferences preferences;
+Adafruit_VL53L0X lox;
+
+// Kalibrierwerte
+int minDistance = 0;
+int maxDistance = 0;
+
+// Keep-Alive
+unsigned long lastKeepAlive = 0;
+const unsigned long keepAliveInterval = 15 * 60 * 1000; // 15 Minuten in ms
+
+// SIM800L über UART1 ansteuern
+HardwareSerial sim800(1);
+
+//
+// ----- Vorwärtsdeklarationen globaler Funktionen ----------------
+void powerOnSIM800L();
+void powerOffSIM800L();
+void sendDeviceInfo();
+void sendCalibrationData();
+void sendLetterEvent(int distance);
+void sendDoorEvent(int distance);
+void sendKeepAlive();
+void sendLogs();        // NEU: Logs senden
+void addLogEntry(const String &entry); // NEU: Log-Eintrag hinzufügen
+void configureDeepSleep();
+bool isResetButtonPressed();
+String getLocalMacAddress();
+void calibrateVL53L0X();
+String measureForFiveSeconds(); // Rückgabewert: "door_opened", "letter_detected", "no_event"
+
+//
+// -------------------------------------------------------------
+// Internet-Verbindungsmanagement – GPRSManager Klasse
+// -------------------------------------------------------------
+class GPRSManager {
+public:
+  GPRSManager(HardwareSerial &serial) : modem(serial) {}
+
+  bool initModem() {
+    powerOnSIM800L(); // Stelle sicher, dass SIM800L eingeschaltet ist bei Initialisierung
+    modem.begin(MODEM_BAUD, SERIAL_8N1, MODEM_RX, MODEM_TX);
+    delay(2000);
+    String resp = sendAT("AT", 2000);
+    if (resp.indexOf("OK") == -1) {
+      Serial.println("[MODEM] ❌ Keine Antwort vom Modem.");
+      return false;
+    } else {
+      Serial.println("[MODEM] ✅ Modem reagiert.");
+      // Setze GSM-Modus
+      sendAT("AT+CNMP=2", 1000);
+      sendAT("AT+CMNB=0", 1000);
+      return true;
+    }
+  }
+
+  bool waitForNetworkRegistration(uint32_t timeout = 60000) {
+    Serial.println("[GPRS] Warte auf Netzregistrierung...");
+    unsigned long start = millis();
+    while (millis() - start < timeout) {
+      String resp = sendAT("AT+CREG?", 2000);
+      if (resp.indexOf("+CREG: 0,1") != -1 || resp.indexOf("+CREG: 0,5") != -1) {
+        Serial.println("[GPRS] Netz registriert.");
+        return true;
+      }
+      delay(2000);
+    }
+    Serial.println("[GPRS] Netzregistrierung fehlgeschlagen.");
+    return false;
+  }
+
+  bool openConnection() {
+    Serial.println("[GPRS] Starte Internet-Verbindung (SAPBR)...");
+    // Beende alte Sessions
+    sendAT("AT+HTTPTERM", 1000);
+    sendAT("AT+CIPSHUT", 3000);
+
+    // Konfiguriere Bearer
+    sendAT("AT+SAPBR=3,1,\"CONTYPE\",\"GPRS\"", 1000);
+    sendAT("AT+SAPBR=3,1,\"APN\",\"" + String(APN) + "\"", 1000);
+    if (strlen(APN_USER) > 0) {
+      sendAT("AT+SAPBR=3,1,\"USER\",\"" + String(APN_USER) + "\"", 1000);
+    }
+    if (strlen(APN_PASS) > 0) {
+      sendAT("AT+SAPBR=3,1,\"PWD\",\"" + String(APN_PASS) + "\"", 1000);
+    }
+    String resp = sendAT("AT+SAPBR=1,1", 6000);
+    if (resp.indexOf("OK") == -1) {
+      Serial.println("[GPRS] ❌ Konnte SAPBR nicht öffnen!");
+      return false;
+    }
+    resp = sendAT("AT+SAPBR=2,1", 2000);
+    if (resp.indexOf("+SAPBR: 1,1") == -1) {
+      Serial.println("[GPRS] ❌ Keine IP erhalten?");
+      return false;
+    }
+    Serial.println("[GPRS] ✅ SAPBR-Verbindung aktiv.");
+    return true;
+  }
+
+  void closeConnection() {
+    sendAT("AT+HTTPTERM", 1000);
+    sendAT("AT+SAPBR=0,1", 3000);
+    sendAT("AT+CIPSHUT", 3000);
+    Serial.println("[GPRS] Verbindung beendet.");
+  }
+
+  bool sendHttpPOST(const String& serverUrl, const String& jsonPayload, int maxRetries = 3) {
+    for (int attempt = 1; attempt <= maxRetries; attempt++) {
+      Serial.printf("[HTTP] POST Versuch %d von %d\n", attempt, maxRetries);
+      if (sendSingleHttpPOST(serverUrl, jsonPayload)) {
+        return true;
+      }
+      delay(2000);
+    }
+    return false;
+  }
+
+  String debugSendAT(const String& cmd, uint32_t timeout = 2000) {
+    return sendAT(cmd, timeout);
+  }
+
+private:
+  HardwareSerial &modem;
+
+  String sendAT(const String& cmd, uint32_t timeout = 2000) {
+    modem.println(cmd);
+    unsigned long start = millis();
+    String resp = "";
+    while (millis() - start < timeout) {
+      while (modem.available()) {
+        char c = modem.read();
+        resp += c;
+      }
+      delay(10);
+    }
+    Serial.println(">> " + resp);
+    return resp;
+  }
+
+  bool readUntil(const String& target, uint32_t timeout, String& response) {
+    unsigned long start = millis();
+    response = "";
+    while (millis() - start < timeout) {
+      while (modem.available()) {
+        char c = modem.read();
+        response += c;
+        if (response.indexOf(target) != -1) {
+          return true;
+        }
+      }
+      delay(10);
+    }
+    return false;
+  }
+
+  bool sendSingleHttpPOST(const String& serverUrl, const String& jsonPayload) {
+    if (!waitForNetworkRegistration()) {
+      Serial.println("[HTTP] ❌ Netz nicht registriert. Abbruch.");
+      return false;
+    }
+    if (!openConnection()) {
+      Serial.println("[HTTP] ❌ Konnte keine GPRS-Verbindung öffnen.");
+      return false;
+    }
+    sendAT("AT+HTTPTERM", 1000);
+    sendAT("AT+HTTPINIT", 1000);
+    sendAT("AT+HTTPPARA=\"CID\",1", 500);
+    sendAT("AT+HTTPSSL=0", 500);
+    sendAT("AT+HTTPPARA=\"URL\",\"" + serverUrl + "\"", 1000);
+    sendAT("AT+HTTPPARA=\"CONTENT\",\"application/json\"", 500);
+    int length = jsonPayload.length();
+    Serial.printf("[HTTP] Sende %d Bytes an %s\n", length, serverUrl.c_str());
+    String httpDataCmd = "AT+HTTPDATA=" + String(length) + ",15000";
+    String resp = sendAT(httpDataCmd, 3000);
+    if (resp.indexOf("DOWNLOAD") == -1) {
+      Serial.println("[HTTP] ❌ HTTPDATA-Fehler.");
+      sendAT("AT+HTTPTERM", 500);
+      closeConnection();
+      return false;
+    }
+    delay(300);
+    modem.write(jsonPayload.c_str(), length);
+    delay(500);
+    sendAT("AT+HTTPACTION=1", 2000);
+    Serial.println("[HTTP] HTTP-POST gesendet. Warte auf Antwort...");
+    String actionResp = "";
+    bool success = readUntil("+HTTPACTION: 1,", 20000, actionResp);
+    if (success) {
+      int statusCode = actionResp.substring(actionResp.indexOf("+HTTPACTION: 1,") + 14,
+                                          actionResp.indexOf(",", actionResp.indexOf("+HTTPACTION: 1,") + 14)).toInt();
+      if (statusCode == 200 || statusCode == 201) {
+        Serial.printf("[HTTP] ✅ HTTP-POST erfolgreich! (Status %d)\n", statusCode);
+      } else {
+        Serial.printf("[HTTP] ❌ Fehlerhafte HTTP-Antwort: %d\n", statusCode);
+      }
+    } else {
+      Serial.println("[HTTP] ❌ Keine Antwort erhalten.");
+    }
+    resp = sendAT("AT+HTTPREAD", 5000);
+    Serial.println("[HTTP] Server-Antwort:\n" + resp);
+    sendAT("AT+HTTPTERM", 500);
+    closeConnection();
+    Serial.println("[HTTP] ✅ POST erfolgreich gesendet.");
+    return true;
+  }
+};
+
+GPRSManager gprs(sim800);
+
+//
+// ----- Neue Funktionen: Log-Einträge speichern und senden ----------------
+//
+void addLogEntry(const String &entry) {
+  // Lese vorhandene Logs (als kommaseparierte Liste im JSON-Format)
+  String currentLogs = preferences.getString("logs", "");
+  if (currentLogs.length() > 0) {
+    currentLogs += ",";
+  }
+  // Füge den neuen Eintrag hinzu – hier wird als Zeitstempel einfach millis() genutzt
+  currentLogs += "\"[" + String(millis()) + "] " + entry + "\"";
+  preferences.putString("logs", currentLogs);
+  Serial.println("[LOG] Hinzugefügt: " + entry);
+}
+
+void sendLogs() {
+  Serial.println("[DEBUG] -> sendLogs()");
+  String logsData = preferences.getString("logs", "");
+  if (logsData.length() == 0) {
+    Serial.println("[LOGS] Keine Logs zum Senden.");
+    return;
+  }
+  // Hole die MAC-Adresse aus den Preferences
+  String macAddress = preferences.getString("mac_address", "Unbekannt");
+  // Erstelle den Payload mit mac_address und logs als Array
+  String payload = "{\"mac_address\":\"" + macAddress + "\",\"logs\":[" + logsData + "]}";
+  
+  // Sicherstellen, dass das Modem an ist und initialisiert werden kann:
+  powerOnSIM800L();
+  if (!gprs.initModem()) {
+    Serial.println("[LOGS] Modem-Initialisierung fehlgeschlagen, Logs werden nicht gesendet.");
+    return;
+  }
+  bool success = gprs.sendHttpPOST(logsServerUrl, payload);
+  if (success) {
+    Serial.println("[LOGS] Logs erfolgreich gesendet. Lösche lokale Logs.");
+    preferences.remove("logs");
+  } else {
+    Serial.println("[LOGS] Logs senden fehlgeschlagen. Behalte lokale Logs.");
+  }
+}
+
+
+//
+// ----- SIM800L- und VL53L0X-Funktionen ----------------
+//
+void powerOnSIM800L() {
+  Serial.println("[MODEM] Schalte SIM800L ein...");
+  pinMode(MODEM_POWER_ON, OUTPUT);
+  pinMode(MODEM_PWRKEY, OUTPUT);
+  digitalWrite(MODEM_POWER_ON, HIGH);
+  delay(100);
+  digitalWrite(MODEM_PWRKEY, LOW);
+  delay(1000);
+  digitalWrite(MODEM_PWRKEY, HIGH);
+  delay(4000); // Längere Einschaltverzögerung, um sicherzustellen, dass das Modem bereit ist
+  Serial.println("[MODEM] SIM800L Einschaltvorgang abgeschlossen.");
+}
+
+void powerOffSIM800L() {
+  Serial.println("[MODEM] Schalte SIM800L aus...");
+  digitalWrite(MODEM_PWRKEY, LOW);
+  delay(1000); // Mindestens 1 Sekunde LOW für korrektes Herunterfahren
+  digitalWrite(MODEM_PWRKEY, HIGH);
+  digitalWrite(MODEM_POWER_ON, LOW); // Deaktiviere Power-Enable, um Stromverbrauch komplett zu stoppen
+  Serial.println("[MODEM] SIM800L ausgeschaltet.");
+}
+
+void calibrateVL53L0X() {
+  Serial.println("[CALIBRATION] Initialisiere VL53L0X...");
+  if (!lox.begin()) {
+    Serial.println("[ERROR] VL53L0X konnte nicht initialisiert werden!");
+    return;
+  }
+  unsigned long startTime = millis();
+  unsigned long duration = 3000; // 3 Sekunden messen
+  int currentMin = 9999;
+  int currentMax = 0;
+  Serial.println("[CALIBRATION] Messe 3 Sekunden...");
+  while (millis() - startTime < duration) {
+    VL53L0X_RangingMeasurementData_t measure;
+    lox.rangingTest(&measure, false);
+    if (measure.RangeStatus != 4) {
+      int distance = measure.RangeMilliMeter;
+      if (distance < currentMin) currentMin = distance;
+      if (distance > currentMax) currentMax = distance;
+      Serial.printf("[CAL] Distanz: %d mm\n", distance);
+    } else {
+      Serial.println("[CAL] Ungültige Messung...");
+    }
+    delay(50);
+  }
+  if (currentMin < 9999 && currentMax > 0) {
+    minDistance = currentMin - 15;
+    maxDistance = currentMax + 15;
+    preferences.putInt("minDistance", minDistance);
+    preferences.putInt("maxDistance", maxDistance);
+    Serial.printf("[CAL DONE] Min: %d mm, Max: %d mm\n", minDistance, maxDistance);
+  } else {
+    Serial.println("[ERROR] Kalibrierung fehlgeschlagen!");
+  }
+}
+
+// Rückgabewert: "door_opened", "letter_detected", "no_event"
+String measureForFiveSeconds() {
+  Serial.println("[MEASURE] Starte 5-Sekunden-Messung...");
+  if (!lox.begin()) {
+    Serial.println("[ERROR] VL53L0X konnte nicht initialisiert werden!");
+    return "no_event"; // Fehlerfall: Kein Ereignis
+  }
+  lox.setMeasurementTimingBudgetMicroSeconds(20000);
+  unsigned long startTime = millis();
+  std::vector<int> distanceBuffer;
+  int invalidCount = 0;
+  while (millis() - startTime < 5000) {
+    VL53L0X_RangingMeasurementData_t measure;
+    lox.rangingTest(&measure, false);
+    if (measure.RangeStatus != 4) {
+      int distance = measure.RangeMilliMeter;
+      distanceBuffer.push_back(distance);
+      Serial.printf("[MEAS] Distanz: %d mm\n", distance);
+    } else {
+      Serial.println("[MEAS] Ungültig...");
+      invalidCount++;
+    }
+    delay(20);
+  }
+  if (distanceBuffer.empty()) {
+    Serial.println("[MEAS] Keine gültigen Messwerte.");
+    return "no_event"; // Kein Ereignis, da keine gültigen Messwerte
+  }
+  int minValue = *std::min_element(distanceBuffer.begin(), distanceBuffer.end());
+  int maxValue = *std::max_element(distanceBuffer.begin(), distanceBuffer.end());
+  int averageValue = std::accumulate(distanceBuffer.begin(), distanceBuffer.end(), 0) / (int)distanceBuffer.size();
+  Serial.printf("[ANALYSE] Min: %d, Max: %d, Avg: %d\n", minValue, maxValue, averageValue);
+
+  if (maxValue > maxDistance) {
+    Serial.printf("[EVENT] Tür geöffnet (maxDist=%d)\n", maxValue);
+    preferences.putInt("minValue", minValue);
+    preferences.putInt("maxValue", maxValue);
+    return "door_opened"; // Tür geöffnet -> Ereignis
+  } else if (minValue < minDistance) {
+    Serial.printf("[EVENT] Brief erkannt (minDist=%d)\n", minValue);
+    preferences.putInt("minValue", minValue); // Speichere minValue und maxValue für späteren Zugriff
+    preferences.putInt("maxValue", maxValue);
+    return "letter_detected"; // Brief erkannt -> Ereignis
+  } else {
+    Serial.println("[INFO] Kein Ereignis erkannt.");
+    return "no_event"; // Kein Ereignis
+  }
+}
+
+void sendDeviceInfo() {
+  Serial.println("[DEBUG] -> sendDeviceInfo()");
+  String macAddress = preferences.getString("mac_address", "Unbekannt");
+  String payload = String("{\"mac_address\":\"") + macAddress +
+                     "\",\"firmware_version\":\"1.0.0\"}";
+  gprs.sendHttpPOST(registrationServerUrl, payload);
+  addLogEntry("Device info sent.");
+}
+
+void sendCalibrationData() {
+  Serial.println("[DEBUG] -> sendCalibrationData()");
+  String macAddress = preferences.getString("mac_address", "Unbekannt");
+  String payload = "{\"mac_address\":\"" + macAddress +
+                     "\",\"min_distance\":" + String(minDistance) +
+                     ",\"max_distance\":" + String(maxDistance) + "}";
+  gprs.sendHttpPOST(calibrationServerUrl, payload);
+  addLogEntry("Calibration data sent.");
+}
+
+void sendLetterEvent(int distance) {
+  Serial.println("[DEBUG] -> sendLetterEvent()");
+  String macAddress = preferences.getString("mac_address", "Unbekannt");
+  String payload = String("{\"mac_address\":\"") + macAddress +
+                     "\",\"event\":\"letter_detected\",\"distance\":" + String(distance) + "}";
+  bool result = gprs.sendHttpPOST(letterServerUrl, payload);
+  if(result) {
+    addLogEntry("Letter event sent with distance: " + String(distance));
+  } else {
+    addLogEntry("Letter event FAILED with distance: " + String(distance));
+  }
+}
+
+void sendDoorEvent(int distance) {
+  Serial.println("[DEBUG] -> sendDoorEvent()");
+  String macAddress = preferences.getString("mac_address", "Unbekannt");
+  String payload = String("{\"mac_address\":\"") + macAddress +
+                     "\",\"event\":\"door_opened\",\"distance\":" + String(distance) + "}";
+  bool result = gprs.sendHttpPOST(doorServerUrl, payload);
+  if(result) {
+    addLogEntry("Door event sent with distance: " + String(distance));
+  } else {
+    addLogEntry("Door event FAILED with distance: " + String(distance));
+  }
+}
+
+void sendKeepAlive() {
+  Serial.println("[DEBUG] -> sendKeepAlive()");
+  String macAddress = preferences.getString("mac_address", "Unbekannt");
+  String payload = String("{\"mac_address\":\"") + macAddress + "\"}";
+  bool result = gprs.sendHttpPOST(keepaliveServerUrl, payload);
+  if (result) {
+    Serial.println("[KEEPALIVE] ✅ Keep Alive erfolgreich gesendet.");
+    addLogEntry("Keepalive sent successfully.");
+  } else {
+    Serial.println("[KEEPALIVE] ❌ Keep Alive fehlgeschlagen.");
+    addLogEntry("Keepalive sending FAILED.");
+  }
+}
+
+//
+// ----- Deep-Sleep-Konfiguration (EXT0 + Timer) ---------------------
+//
+void configureDeepSleep() {
+  Serial.println("[SLEEP] -> configureDeepSleep()");
+  // Schalte SIM800L aus, bevor ESP32 in Deep Sleep geht
+  powerOffSIM800L();
+  // RTC-Konfiguration für den PIR-Pin
+  rtc_gpio_init((gpio_num_t)PIR_PIN);
+  rtc_gpio_set_direction((gpio_num_t)PIR_PIN, RTC_GPIO_MODE_INPUT_ONLY);
+  rtc_gpio_pulldown_en((gpio_num_t)PIR_PIN);
+  rtc_gpio_pullup_dis((gpio_num_t)PIR_PIN);
+  // EXT0-Wake-up: Bei steigendem Pegel am PIR_PIN
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)PIR_PIN, 1);
+  // Timer-Wake-up (15 Minuten)
+  esp_sleep_enable_timer_wakeup((uint64_t)keepAliveInterval * 1000ULL);
+  Serial.println("[SLEEP] Vor esp_deep_sleep_start()");
+  delay(5000);
+  Serial.println("[SLEEP] Jetzt Deep Sleep!");
+  esp_deep_sleep_start();
+  Serial.println("[SLEEP] Nach esp_deep_sleep_start() - sollte NICHT erreicht werden!");
+}
+
+bool isResetButtonPressed() {
+  const unsigned long debounceTime = 2000;
+  unsigned long pressedTime = 0;
+  if (digitalRead(RESET_BUTTON_PIN) == LOW) {
+    Serial.println("[INFO] Reset-Taster erkannt. Warte...");
+    pressedTime = millis();
+    while (digitalRead(RESET_BUTTON_PIN) == LOW) {
+      delay(100);
+      if (millis() - pressedTime > debounceTime) {
+        Serial.println("[INFO] Reset-Taster >2s gedrückt.");
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+String getLocalMacAddress() {
+  uint64_t chipid = ESP.getEfuseMac();
+  char macStr[13];
+  sprintf(macStr, "%04X%08X", (uint16_t)(chipid >> 32), (uint32_t)chipid);
+  return String(macStr);
+}
+
+//
+// ----- SETUP & LOOP -------------------
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("\n=== TTGO T-Call (SAPBR-only) - EXT0 PIR Wake - OPTIMIERTER CODE (OHNE DOUBLE-CHECK) ===");
+  Serial.println("=== VERSION MIT TÜRKONTROLLE VOR BRIEF-ERKENNUNG ===");
+
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  // Für EXT0 verwenden wir den PIR-Pin als INPUT (kein interner Pull-Down, da wir über RTC konfigurieren)
+  pinMode(PIR_PIN, INPUT);
+  pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
+
+  preferences.begin("briefkasten", false);
+
+  // Prüfe, ob bereits eine MAC-Adresse gespeichert ist
+  String storedMac = preferences.getString("mac_address", "");
+  if (storedMac.isEmpty()) {
+    String newMac = getLocalMacAddress();
+    preferences.putString("mac_address", newMac);
+    Serial.println("[INFO] Neue MAC/ID abgespeichert: " + newMac);
+  } else {
+    Serial.println("[INFO] MAC/ID bereits vorhanden: " + storedMac);
+  }
+
+  // Ermitteln des Wake-up-Grunds
+  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+  Serial.printf("[WAKEUP] wakeup_reason: %d\n", wakeup_reason);
+
+  if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0) {
+    Serial.println("============================================");
+    Serial.println("[WAKEUP] Durch PIR (EXT0) aufgewacht!");
+
+    // Lade Kalibrierungsdaten
+    minDistance = preferences.getInt("minDistance", 0);
+    maxDistance = preferences.getInt("maxDistance", 0);
+    Serial.printf("[INFO] Geladene Kalibrierung: min=%d, max=%d\n", minDistance, maxDistance);
+    if (minDistance == 0 || maxDistance == 0) {
+      Serial.println("[ERROR] Keine Kalibrierung! Starte Kalibrierung...");
+      calibrateVL53L0X();
+    }
+    // **NEU: Messe zuerst, SIM800L noch AUS**
+    String eventType = measureForFiveSeconds(); // Messe und prüfe auf Ereignis
+    if (eventType == "door_opened") {
+      Serial.println("[INFO] Tür geöffnet erkannt, schalte SIM800L ein und sende Door-Event...");
+      powerOnSIM800L(); // SIM800L nur einschalten, wenn Ereignis erkannt!
+      if (!gprs.initModem()) {
+        Serial.println("[ERROR] Modem-Initialisierung fehlgeschlagen nach PIR-Wakeup!");
+      } else {
+        sendDoorEvent(preferences.getInt("maxValue", 0)); // Tür-Event senden
+      }
+    } else if (eventType == "letter_detected") {
+      Serial.println("[INFO] Brief erkannt, schalte SIM800L ein und sende Letter-Event...");
+      powerOnSIM800L(); // SIM800L nur einschalten, wenn Ereignis erkannt!
+      if (!gprs.initModem()) {
+        Serial.println("[ERROR] Modem-Initialisierung fehlgeschlagen nach PIR-Wakeup!");
+      } else {
+        sendLetterEvent(preferences.getInt("minValue", 0)); // Brief-Event senden
+      }
+    } else {
+      Serial.println("[INFO] Kein Ereignis nach PIR-Wakeup.");
+      addLogEntry("PIR wakeup: no event detected.");
+    }
+    // Vor dem Deep-Sleep werden alle vorhandenen Logs gesendet.
+    sendLogs();
+    configureDeepSleep();
+
+  } else if (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER) {
+    Serial.println("============================================");
+    Serial.println("[WAKEUP] Durch Timer (Keep-Alive) aufgewacht!");
+    delay(2000);
+    powerOnSIM800L(); // SIM800L für Keep-Alive einschalten
+    if (!gprs.initModem()) {
+      Serial.println("[ERROR] Modem-Initialisierung fehlgeschlagen für Keep-Alive!");
+    } else {
+      sendKeepAlive();
+    }
+    // Auch hier können vorhandene Logs gesendet werden (optional – je nach Anforderung)
+    sendLogs();
+    configureDeepSleep();
+
+  } else {
+    Serial.println("============================================");
+    Serial.println("[START] Power On oder Reset.");
+    bool resetRequested = isResetButtonPressed();
+    if (resetRequested) {
+      Serial.println("[INFO] Reset-Taster >2s gedrückt.");
+      // Hier könnte man ggf. Preferences löschen.
+    }
+    String macAddress = preferences.getString("mac_address", "Unbekannt");
+    Serial.println("[INFO] MAC/ID: " + macAddress);
+    powerOnSIM800L(); // SIM800L einschalten für DeviceInfo und Calibration
+    if (!gprs.initModem()) {
+      Serial.println("[ERROR] Modem-Initialisierung fehlgeschlagen.");
+      while(1); // Endlosschleife, um Fehler zu signalisieren
+    }
+    sendDeviceInfo();
+    Serial.println("[INFO] Starte Kalibrierung in 3s...");
+    delay(3000);
+    calibrateVL53L0X();
+    sendCalibrationData();
+    // Auch hier können Logs (z. B. von vorherigen Zyklen) gesendet werden
+    sendLogs();
+    configureDeepSleep();
+  }
+}
+
+void loop() {
+  // Da der ESP32 in den Deep Sleep geht, wird loop() normalerweise nie erreicht.
+}
