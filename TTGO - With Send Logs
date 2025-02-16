@@ -2,11 +2,13 @@
  * TTGO T-Call (SAPBR-only) – Briefkasten-Logic mit VL53L0X,
  * PIR-Sensor und SIM800L.
  * Optimierter Code: SIM800L nur bei Ereignis-Übertragung aktiv
- * Wake-up: EXT0 (PIR, RISING) & Timer (15 min Keep-Alive)
+ * Wake-up: EXT0 (PIR, RISING) & Timer (60 min Keep-Alive)
  *
  * VERSION OHNE PIR-SIGNAL DOUBLE-CHECK
  * VERSION MIT TÜRKONTROLLE VOR BRIEF-ERKENNUNG
  * ERWEITERUNG: Logs sammeln und vor Deep-Sleep an den Server senden
+ * NEU: Während der 10-Sekunden-Messung werden ALLE ermittelten Distanzen
+ *      an den Server gesendet.
  ******************************************************/
 
 #include <HardwareSerial.h>
@@ -42,6 +44,8 @@ const char* letterServerUrl       = "http://45.195.250.247:8002/letter";
 const char* doorServerUrl         = "http://45.195.250.247:8002/door";
 const char* keepaliveServerUrl    = "http://45.195.250.247:8002/keepalive";
 const char* logsServerUrl         = "http://45.195.250.247:8002/logs";  // NEUER ENDPOINT FÜR LOGS
+// NEUER ENDPOINT FÜR ALLE MESSWERTE (10-Sekunden-Messung)
+const char* measurementsServerUrl = "http://45.195.250.247:8002/measurements";
 
 // ====================== Globale Variablen =================================
 Preferences preferences;
@@ -52,8 +56,9 @@ int minDistance = 0;
 int maxDistance = 0;
 
 // Keep-Alive
+// Intervall auf 60 Minuten (60*60*1000 ms) geändert
 unsigned long lastKeepAlive = 0;
-const unsigned long keepAliveInterval = 15 * 60 * 1000; // 15 Minuten in ms
+const unsigned long keepAliveInterval = 60 * 60 * 1000; // 60 Minuten in ms
 
 // SIM800L über UART1 ansteuern
 HardwareSerial sim800(1);
@@ -73,7 +78,11 @@ void configureDeepSleep();
 bool isResetButtonPressed();
 String getLocalMacAddress();
 void calibrateVL53L0X();
-String measureForFiveSeconds(); // Rückgabewert: "door_opened", "letter_detected", "no_event"
+
+// NEU: Ermittelt alle Messwerte in 10 Sekunden und gibt sie als Vektor zurück
+std::vector<int> collectMeasurementsForFiveSeconds();
+// NEU: Sendet die gesammelten Messwerte als JSON an den Server
+void sendMeasurements(const std::vector<int>& measurements);
 
 //
 // -------------------------------------------------------------
@@ -296,7 +305,6 @@ void sendLogs() {
   }
 }
 
-
 //
 // ----- SIM800L- und VL53L0X-Funktionen ----------------
 //
@@ -357,18 +365,17 @@ void calibrateVL53L0X() {
   }
 }
 
-// Rückgabewert: "door_opened", "letter_detected", "no_event"
-String measureForFiveSeconds() {
-  Serial.println("[MEASURE] Starte 5-Sekunden-Messung...");
+// NEU: Ermittelt alle Messwerte in 10 Sekunden und gibt sie als Vektor zurück
+std::vector<int> collectMeasurementsForFiveSeconds() {
+  std::vector<int> distanceBuffer;
+  Serial.println("[MEASURE] Starte 10-Sekunden-Messung...");
   if (!lox.begin()) {
     Serial.println("[ERROR] VL53L0X konnte nicht initialisiert werden!");
-    return "no_event"; // Fehlerfall: Kein Ereignis
+    return distanceBuffer; // Leerer Vektor bei Fehler
   }
   lox.setMeasurementTimingBudgetMicroSeconds(20000);
   unsigned long startTime = millis();
-  std::vector<int> distanceBuffer;
-  int invalidCount = 0;
-  while (millis() - startTime < 5000) {
+  while (millis() - startTime < 10000) { // 10 Sekunden Messzeit
     VL53L0X_RangingMeasurementData_t measure;
     lox.rangingTest(&measure, false);
     if (measure.RangeStatus != 4) {
@@ -377,32 +384,31 @@ String measureForFiveSeconds() {
       Serial.printf("[MEAS] Distanz: %d mm\n", distance);
     } else {
       Serial.println("[MEAS] Ungültig...");
-      invalidCount++;
     }
     delay(20);
   }
-  if (distanceBuffer.empty()) {
-    Serial.println("[MEAS] Keine gültigen Messwerte.");
-    return "no_event"; // Kein Ereignis, da keine gültigen Messwerte
-  }
-  int minValue = *std::min_element(distanceBuffer.begin(), distanceBuffer.end());
-  int maxValue = *std::max_element(distanceBuffer.begin(), distanceBuffer.end());
-  int averageValue = std::accumulate(distanceBuffer.begin(), distanceBuffer.end(), 0) / (int)distanceBuffer.size();
-  Serial.printf("[ANALYSE] Min: %d, Max: %d, Avg: %d\n", minValue, maxValue, averageValue);
+  return distanceBuffer;
+}
 
-  if (maxValue > maxDistance) {
-    Serial.printf("[EVENT] Tür geöffnet (maxDist=%d)\n", maxValue);
-    preferences.putInt("minValue", minValue);
-    preferences.putInt("maxValue", maxValue);
-    return "door_opened"; // Tür geöffnet -> Ereignis
-  } else if (minValue < minDistance) {
-    Serial.printf("[EVENT] Brief erkannt (minDist=%d)\n", minValue);
-    preferences.putInt("minValue", minValue); // Speichere minValue und maxValue für späteren Zugriff
-    preferences.putInt("maxValue", maxValue);
-    return "letter_detected"; // Brief erkannt -> Ereignis
+// NEU: Sendet die gesammelten Messwerte als JSON an den Server
+void sendMeasurements(const std::vector<int>& measurements) {
+  String jsonArray = "[";
+  for (size_t i = 0; i < measurements.size(); i++) {
+    jsonArray += String(measurements[i]);
+    if (i < measurements.size() - 1) {
+      jsonArray += ",";
+    }
+  }
+  jsonArray += "]";
+  
+  String macAddress = preferences.getString("mac_address", "Unbekannt");
+  String payload = "{\"mac_address\":\"" + macAddress + "\",\"measurements\":" + jsonArray + "}";
+  Serial.println("[MEASURE SEND] Payload: " + payload);
+  bool result = gprs.sendHttpPOST(measurementsServerUrl, payload);
+  if(result) {
+    addLogEntry("Measurements sent: " + jsonArray);
   } else {
-    Serial.println("[INFO] Kein Ereignis erkannt.");
-    return "no_event"; // Kein Ereignis
+    addLogEntry("Measurements FAILED: " + jsonArray);
   }
 }
 
@@ -479,7 +485,7 @@ void configureDeepSleep() {
   rtc_gpio_pullup_dis((gpio_num_t)PIR_PIN);
   // EXT0-Wake-up: Bei steigendem Pegel am PIR_PIN
   esp_sleep_enable_ext0_wakeup((gpio_num_t)PIR_PIN, 1);
-  // Timer-Wake-up (15 Minuten)
+  // Timer-Wake-up (60 Minuten)
   esp_sleep_enable_timer_wakeup((uint64_t)keepAliveInterval * 1000ULL);
   Serial.println("[SLEEP] Vor esp_deep_sleep_start()");
   delay(5000);
@@ -554,28 +560,38 @@ void setup() {
       Serial.println("[ERROR] Keine Kalibrierung! Starte Kalibrierung...");
       calibrateVL53L0X();
     }
-    // **NEU: Messe zuerst, SIM800L noch AUS**
-    String eventType = measureForFiveSeconds(); // Messe und prüfe auf Ereignis
-    if (eventType == "door_opened") {
-      Serial.println("[INFO] Tür geöffnet erkannt, schalte SIM800L ein und sende Door-Event...");
-      powerOnSIM800L(); // SIM800L nur einschalten, wenn Ereignis erkannt!
-      if (!gprs.initModem()) {
-        Serial.println("[ERROR] Modem-Initialisierung fehlgeschlagen nach PIR-Wakeup!");
+
+    // NEU: Messung aller Abstände in 10 Sekunden
+    std::vector<int> measurements = collectMeasurementsForFiveSeconds();
+
+    // SIM800L einschalten, um die Messwerte zu senden und Events zu melden
+    powerOnSIM800L();
+    if (!gprs.initModem()) {
+      Serial.println("[ERROR] Modem-Initialisierung fehlgeschlagen nach PIR-Wakeup!");
+    } else {
+      // Sende alle gemessenen Distanzen an den Server
+      sendMeasurements(measurements);
+    }
+    
+    // Analysiere die Messwerte für die Event-Erkennung
+    if (!measurements.empty()) {
+      int minValue = *std::min_element(measurements.begin(), measurements.end());
+      int maxValue = *std::max_element(measurements.begin(), measurements.end());
+      Serial.printf("[ANALYSE] Min: %d, Max: %d\n", minValue, maxValue);
+      if (maxValue > maxDistance) {
+        Serial.printf("[EVENT] Tür geöffnet erkannt (maxDist=%d)\n", maxValue);
+        sendDoorEvent(maxValue);
+      } else if (minValue < minDistance) {
+        Serial.printf("[EVENT] Brief erkannt (minDist=%d)\n", minValue);
+        sendLetterEvent(minValue);
       } else {
-        sendDoorEvent(preferences.getInt("maxValue", 0)); // Tür-Event senden
-      }
-    } else if (eventType == "letter_detected") {
-      Serial.println("[INFO] Brief erkannt, schalte SIM800L ein und sende Letter-Event...");
-      powerOnSIM800L(); // SIM800L nur einschalten, wenn Ereignis erkannt!
-      if (!gprs.initModem()) {
-        Serial.println("[ERROR] Modem-Initialisierung fehlgeschlagen nach PIR-Wakeup!");
-      } else {
-        sendLetterEvent(preferences.getInt("minValue", 0)); // Brief-Event senden
+        Serial.println("[INFO] Kein Ereignis erkannt.");
+        addLogEntry("PIR wakeup: no event detected.");
       }
     } else {
-      Serial.println("[INFO] Kein Ereignis nach PIR-Wakeup.");
-      addLogEntry("PIR wakeup: no event detected.");
+      Serial.println("[MEASURE] Keine gültigen Messwerte erfasst.");
     }
+    
     // Vor dem Deep-Sleep werden alle vorhandenen Logs gesendet.
     sendLogs();
     configureDeepSleep();
