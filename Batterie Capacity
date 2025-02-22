@@ -1,0 +1,123 @@
+#include <Wire.h>
+
+#define MAX17043_ADDRESS 0x36
+#define MAX_READINGS 10  // Anzahl der Werte für den Median-Filter
+#define SLEEP_TIME 60    // Sleep-Zeit in Sekunden (1 Minute)
+#define STABILIZATION_TIME 15000  // Wartezeit nach Aufwachen in Millisekunden (15 Sekunden)
+
+// Variablen für die Messungen
+float voltageReadings[MAX_READINGS] = {0};
+float socReadings[MAX_READINGS] = {0};
+int readIndex = 0;  
+
+// -------------------- FUNKTIONSDEKLARATIONEN --------------------
+void resetMAX17043();
+float readVoltage();
+float readSOC();
+void measureBattery();
+void goToDeepSleep();
+float getMedian(float readings[], int size);
+
+void setup() {
+    Serial.begin(115200);
+    Wire.begin();
+    
+    Serial.println("\n🔄 ESP32 ist aufgewacht!");
+
+    // 1. MAX17043 Soft-Reset
+    resetMAX17043();
+
+    // 2. Stabilisierung nach dem Aufwachen
+    Serial.println("⏳ Warte 15 Sekunden für stabile Werte...");
+    delay(STABILIZATION_TIME);
+
+    // 3. Messung durchführen
+    measureBattery();
+
+    // 4. ESP32 in Deep Sleep versetzen
+    goToDeepSleep();
+}
+
+void loop() {
+    // Wird nicht genutzt, da der ESP nach setup() direkt in den Deep Sleep geht.
+}
+
+// -------------------- BATTERIE MESSFUNKTION --------------------
+void measureBattery() {
+    float totalVoltage = 0;
+    float totalSOC = 0;
+
+    Serial.println("📊 Sammle Messwerte für bessere Genauigkeit...");
+
+    for (int i = 0; i < MAX_READINGS; i++) {
+        voltageReadings[i] = readVoltage();
+        socReadings[i] = readSOC();
+        delay(1000);  
+    }
+
+    // Median berechnen
+    float avgVoltage = getMedian(voltageReadings, MAX_READINGS);
+    float avgSOC = getMedian(socReadings, MAX_READINGS);
+
+    Serial.print("🔋 Batteriestatus (Median): ");
+    Serial.print(avgSOC);
+    Serial.println("%");
+
+    Serial.print("⚡ Spannung (Median): ");
+    Serial.print(avgVoltage);
+    Serial.println(" V");
+}
+
+// -------------------- ESP32 DEEP SLEEP FUNKTION --------------------
+void goToDeepSleep() {
+    Serial.println("💤 ESP32 geht in Deep Sleep für 60 Sekunden...");
+    esp_sleep_enable_timer_wakeup(SLEEP_TIME * 1000000ULL);  
+    esp_deep_sleep_start();  
+}
+
+// -------------------- MAX17043 RESET-FUNKTION --------------------
+void resetMAX17043() {
+    Serial.println("🔄 Soft-Reset des MAX17043...");
+    Wire.beginTransmission(MAX17043_ADDRESS);
+    Wire.write(0xFE);  
+    Wire.endTransmission();
+    delay(1000);
+}
+
+// -------------------- VOLTAGE & SOC MESSUNG --------------------
+float readVoltage() {
+    Wire.beginTransmission(MAX17043_ADDRESS);
+    Wire.write(0x02); // Register für Spannung
+    Wire.endTransmission();
+    Wire.requestFrom(MAX17043_ADDRESS, 2);
+    
+    uint16_t rawVoltage = (Wire.read() << 8) | Wire.read();
+    return (rawVoltage >> 4) * 0.00125; // Umrechnung in Volt
+}
+
+float readSOC() {
+    Wire.beginTransmission(MAX17043_ADDRESS);
+    Wire.write(0x04); // Register für SoC (State of Charge)
+    Wire.endTransmission();
+    Wire.requestFrom(MAX17043_ADDRESS, 2);
+    
+    uint16_t rawSOC = (Wire.read() << 8) | Wire.read();
+    return rawSOC * 0.00390625; // Umrechnung in Prozent
+}
+
+// -------------------- MEDIAN FILTER --------------------
+float getMedian(float readings[], int size) {
+    float temp[size];
+    for (int i = 0; i < size; i++) temp[i] = readings[i];
+
+    for (int i = 0; i < size - 1; i++) {
+        for (int j = i + 1; j < size; j++) {
+            if (temp[j] < temp[i]) {
+                float swap = temp[i];
+                temp[i] = temp[j];
+                temp[j] = swap;
+            }
+        }
+    }
+    return (size % 2 == 0) ? (temp[size / 2 - 1] + temp[size / 2]) / 2.0 : temp[size / 2];
+}
