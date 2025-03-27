@@ -1,0 +1,37 @@
+#define LAMP_PIN 13
+#define PIR_PIN 33
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);  // Stabilisieren
+
+  pinMode(LAMP_PIN, OUTPUT);
+  pinMode(PIR_PIN, INPUT_PULLDOWN);  // GPIO33 sicher LOW halten
+
+  // Wurde Bewegung erkannt?
+  bool bewegung = digitalRead(PIR_PIN) == HIGH;
+
+  if (bewegung) {
+    Serial.println("✅ Bewegung erkannt! Blinken für 5 Sekunden...");
+
+    unsigned long startTime = millis();
+    while (millis() - startTime < 5000) {
+      digitalWrite(LAMP_PIN, HIGH);
+      delay(50);
+      digitalWrite(LAMP_PIN, LOW);
+      delay(50);
+    }
+
+    Serial.println("⏹️  Blinken beendet.");
+  } else {
+    Serial.println("❌ Kein echtes PIR-Signal. Ignorieren.");
+  }
+
+  // Jetzt in Deep Sleep und nur auf WAKE durch PIR (GPIO33 HIGH)
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_33, 1);
+  Serial.println("😴 Gehe in Deep Sleep und warte auf Bewegung...");
+  delay(100);
+  esp_deep_sleep_start();
+}
+
+void loop() {}
