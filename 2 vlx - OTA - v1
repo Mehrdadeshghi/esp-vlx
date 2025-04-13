@@ -1,0 +1,796 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <Wire.h>
+#include <VL53L0X.h>
+#include <Preferences.h>
+#include <WiFiManager.h>
+#include <vector>
+#include <numeric>  // Für std::min_element, std::max_element (optional)
+#include <Update.h>
+#include <ArduinoJson.h>
+
+// ---------------------- Konfiguration ---------------------- //
+
+// Endpoints
+const char* registrationServerUrl   = "http://45.195.250.247:8002/device";
+const char* calibrationServerUrl    = "http://45.195.250.247:8002/calibration";
+const char* letterServerUrl         = "http://45.195.250.247:8002/letter";
+const char* doorServerUrl           = "http://45.195.250.247:8002/door";
+const char* keepaliveServerUrl      = "http://45.195.250.247:8002/keepalive";
+const char* logsServerUrl           = "http://45.195.250.247:8002/logs";
+const char* measurementsServerUrl   = "http://45.195.250.247:8002/measurements";
+
+// OTA-Server
+const char* ota_host                = "http://45.195.250.247:8008";
+#define CURRENT_FIRMWARE_VERSION    "1.0.5.8" // Firmware Version
+
+// Zeitintervalle
+unsigned long lastPingTime          = 0;
+unsigned long lastKeepAlive         = 0;
+const unsigned long keepAliveInterval = 15 * 60 * 1000; // 15 Minuten
+
+// Hardware Pins
+#define PIR_PIN           27
+#define LED_PIN           2
+#define RESET_BUTTON_PIN  0  // Normalerweise BOOT-Button auf ESP32 Dev Kits
+
+// XSHUT Pins für VL53L0X Sensoren
+#define XSHUT_1           25
+#define XSHUT_2           19
+
+// ---------------------- Sensor-Objekte ---------------------- //
+
+// Zwei I2C-Busse für beide Sensoren
+TwoWire I2C_VLX1 = TwoWire(0); // Beispielsweise SDA=21, SCL=22
+TwoWire I2C_VLX2 = TwoWire(1); // Beispielsweise SDA=16, SCL=17
+
+VL53L0X sensor1;
+VL53L0X sensor2;
+
+// ---------------------- Kalibrierungswerte ---------------------- //
+
+int minDistance1 = 0, maxDistance1 = 0;
+int minDistance2 = 0, maxDistance2 = 0;
+
+// ---------------------- Logging ---------------------- //
+String logsBuffer; // Globaler Log-Puffer
+
+// ---------------------- Sensor & Speicher ---------------------- //
+Preferences preferences;
+
+// ---------------------- Vorwärtsdeklarationen ---------------------- //
+void connectToWiFi();
+bool isResetButtonPressed();
+void calibrateSensor(VL53L0X &sensor, int &calibMin, int &calibMax, const String &sensorLabel);
+void analyzeAndSendEventsSensor(const std::vector<int> &distances, int calibMin, int calibMax, const String &sensorLabel);
+void sendMeasurementsForSensor(const std::vector<int> &measurements, const String &sensorLabel);
+void addLogEntry(const String &entry);
+void sendToServer(const char* serverUrl, String jsonPayload);
+void sendPing();
+void checkDeviceFirmware();
+void performOTA(String firmwareUrl);
+void sendDeviceInfo();
+void sendCalibrationData();
+void sendLetterEvent(int distance, const String &sensorLabel);
+void sendDoorEvent(int distance, const String &sensorLabel);
+void sendKeepAlive();
+void sendLogs();
+void configureDeepSleep();
+
+// ---------------------- Sensorinitialisierung ---------------------- //
+void initSensors() {
+  Serial.println("[SENSORS] Initialisiere beide VL53L0X-Sensoren...");
+  // XSHUT-Pins als Ausgang konfigurieren
+  pinMode(XSHUT_1, OUTPUT);
+  pinMode(XSHUT_2, OUTPUT);
+  
+  // Beide Sensoren deaktivieren
+  digitalWrite(XSHUT_1, LOW);
+  digitalWrite(XSHUT_2, LOW);
+  delay(50);
+  
+  // === Sensor 1 initialisieren ===
+  digitalWrite(XSHUT_1, HIGH); // Sensor 1 aktivieren
+  delay(50);
+  I2C_VLX1.begin(21, 22); // Passe die SDA/SCL-Pins an
+  sensor1.setBus(&I2C_VLX1);
+  if (!sensor1.init(true)) {
+    Serial.println("❌ Sensor 1 Init fehlgeschlagen!");
+    addLogEntry("Sensor 1 init failed");
+    while (1);
+  }
+  sensor1.setAddress(0x30);
+  sensor1.setMeasurementTimingBudget(20000);
+  sensor1.startContinuous();
+  Serial.println("✅ Sensor 1 aktiv auf Adresse 0x30");
+  
+  // === Sensor 2 initialisieren ===
+  digitalWrite(XSHUT_2, HIGH); // Sensor 2 aktivieren
+  delay(50);
+  I2C_VLX2.begin(16, 17);
+  sensor2.setBus(&I2C_VLX2);
+  if (!sensor2.init(true)) {
+    Serial.println("❌ Sensor 2 Init fehlgeschlagen!");
+    addLogEntry("Sensor 2 init failed");
+    while (1);
+  }
+  sensor2.setAddress(0x31);
+  sensor2.setMeasurementTimingBudget(20000);
+  sensor2.startContinuous();
+  Serial.println("✅ Sensor 2 aktiv auf Adresse 0x31");
+  
+  Serial.println("[SENSORS] Sensorinitialisierung abgeschlossen.");
+}
+
+// ---------------------- setup() ---------------------- //
+void setup() {
+  pinMode(PIR_PIN, INPUT);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  
+  pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
+  
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("\n\n[BOOT/WAKEUP] Starte...");
+  
+  // Öffne Preferences im Namespace "briefkasten"
+  preferences.begin("briefkasten", false);
+  
+  WiFiManager wifiManager;
+  
+  if (isResetButtonPressed()) {
+    Serial.println("[INFO] Reset-Taster gedrückt -> Lösche gespeicherte WLAN-Daten.");
+    wifiManager.resetSettings();
+    preferences.clear();
+    Serial.println("[INFO] Alle Preferences gelöscht. Neustart...");
+    delay(1000);
+    ESP.restart();
+  }
+  
+  initSensors();
+  
+  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+  
+  if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0) { 
+    // PIR-Aufwachen: Hier sofort Messung, keine Wartezeit für Kalibrierung
+    Serial.println("[WAKEUP] PIR-Sensor (EXT0) geweckt");
+    digitalWrite(LED_PIN, HIGH);
+    
+    // 10s simultane Messung beider Sensoren
+    Serial.println("[MEASURE] Starte 10s simultane Messung beider Sensoren...");
+    std::vector<int> distances1;
+    std::vector<int> distances2;
+    unsigned long start = millis();
+    const unsigned long measureDuration = 10000;
+    while (millis() - start < measureDuration) {
+      int d1 = sensor1.readRangeContinuousMillimeters();
+      int d2 = sensor2.readRangeContinuousMillimeters();
+      if (d1 > 0 && d1 < 8190)
+        distances1.push_back(d1);
+      if (d2 > 0 && d2 < 8190)
+        distances2.push_back(d2);
+      delay(30);
+    }
+    Serial.println("[MEASURE] Simultane Messung beendet.");
+    
+    Serial.println("[WIFI] Verbinde WLAN...");
+    connectToWiFi();
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("[WIFI] Verbunden.");
+      
+      minDistance1 = preferences.getInt("minDistance1", 0);
+      maxDistance1 = preferences.getInt("maxDistance1", 0);
+      minDistance2 = preferences.getInt("minDistance2", 0);
+      maxDistance2 = preferences.getInt("maxDistance2", 0);
+      
+      String macAddress = preferences.getString("mac_address", "Nicht gesetzt");
+      Serial.printf("[INFO] MAC=%s\n", macAddress.c_str());
+      
+      if (minDistance1 == 0 || maxDistance1 == 0 || minDistance2 == 0 || maxDistance2 == 0) {
+        Serial.println("[WARNUNG] Keine (gültigen) Kalibrierungsdaten gefunden.");
+        addLogEntry("Missing or invalid calibration on PIR wakeup.");
+      }
+      
+      if (!distances1.empty())
+        sendMeasurementsForSensor(distances1, "sensor1");
+      else
+        addLogEntry("Keine Messwerte von sensor1 beim PIR-Wakeup.");
+      
+      if (!distances2.empty())
+        sendMeasurementsForSensor(distances2, "sensor2");
+      else
+        addLogEntry("Keine Messwerte von sensor2 beim PIR-Wakeup.");
+      
+      if (minDistance1 != 0 && maxDistance1 != 0)
+        analyzeAndSendEventsSensor(distances1, minDistance1, maxDistance1, "sensor1");
+      else
+        addLogEntry("Überspringe Ereignisanalyse sensor1 wegen fehlender Kalibrierung.");
+      
+      if (minDistance2 != 0 && maxDistance2 != 0)
+        analyzeAndSendEventsSensor(distances2, minDistance2, maxDistance2, "sensor2");
+      else
+        addLogEntry("Überspringe Ereignisanalyse sensor2 wegen fehlender Kalibrierung.");
+      
+      sendLogs();
+    } else {
+      Serial.println("[ERROR] Kein WLAN - Messdaten können nicht gesendet werden.");
+      addLogEntry("No WiFi after PIR measurement. Data lost.");
+    }
+    
+    Serial.println("[DEEPSLEEP] Gehe in Deep Sleep (PIR)...");
+    configureDeepSleep();
+    
+  } else if (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER) {
+    // Timer-Aufwachen für KeepAlive/OTA
+    Serial.println("[WAKEUP] Timer (KeepAlive/OTA Check)");
+    connectToWiFi();
+    if (WiFi.status() == WL_CONNECTED) {
+      sendPing();
+      checkDeviceFirmware();
+      sendKeepAlive();
+      sendLogs();
+    } else {
+      addLogEntry("No WiFi on Timer Wakeup.");
+    }
+    configureDeepSleep();
+    
+  } else {
+    // Normaler Start (Hochfahren/Reset)
+    Serial.printf("[BOOT] Normaler Start (Wakeup-Grund: %d)\n", wakeup_reason);
+    digitalWrite(LED_PIN, HIGH);
+    
+    wifiManager.setConfigPortalTimeout(180);
+    if (!wifiManager.autoConnect("BriefkastenAP")) {
+      addLogEntry("WiFi AutoConnect Failed or Timed Out.");
+      delay(10000);
+      ESP.restart();
+    }
+    
+    Serial.printf("[WIFI] Verbunden! IP=%s\n", WiFi.localIP().toString().c_str());
+    String mac = WiFi.macAddress();
+    Serial.printf("[INFO] MAC Addresse: %s\n", mac.c_str());
+    
+    String storedMac = preferences.getString("mac_address", "");
+    if (storedMac != mac) {
+       preferences.putString("mac_address", mac);
+       addLogEntry(storedMac == "" ? "MAC address stored." : "MAC address updated.");
+    }
+    
+    sendDeviceInfo();
+    
+    // Warten vor der Kalibrierung: 3 Minuten
+    Serial.println("[CAL] Warte 3 Minuten vor der Kalibrierung...");
+    delay(180000);
+    
+    Serial.println("[CAL] Starte Kalibrierung der Sensoren...");
+    calibrateSensor(sensor1, minDistance1, maxDistance1, "sensor1");
+    calibrateSensor(sensor2, minDistance2, maxDistance2, "sensor2");
+    sendCalibrationData();
+    
+    sendPing();
+    checkDeviceFirmware();
+    sendLogs();
+    digitalWrite(LED_PIN, LOW);
+    configureDeepSleep();
+  }
+}
+
+// ---------------------- loop() ---------------------- //
+void loop() {
+  delay(10000);
+  Serial.println("[LOOP] Unerwarteter Loop-Durchlauf. Gehe schlafen...");
+  configureDeepSleep();
+}
+
+// ---------------------- Funktionen ---------------------- //
+
+void connectToWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  Serial.println("[WIFI] Versuche Verbindung mit gespeicherten Daten...");
+  WiFi.begin();
+  int retries = 0;
+  const int maxRetries = 20;
+  while (WiFi.status() != WL_CONNECTED && retries++ < maxRetries) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("[WIFI] Verbunden! IP=%s\n", WiFi.localIP().toString().c_str());
+  } else {
+    Serial.println("[WIFI] Verbindung fehlgeschlagen nach Retries.");
+  }
+}
+
+bool isResetButtonPressed() {
+  if (digitalRead(RESET_BUTTON_PIN) == LOW) {
+    Serial.println("[INFO] Reset-Taster (GPIO0) beim Start LOW erkannt.");
+    unsigned long pressedTime = millis();
+    while (digitalRead(RESET_BUTTON_PIN) == LOW) {
+      delay(50);
+      if (millis() - pressedTime > 2000) {
+        Serial.println("[INFO] Reset-Taster > 2s gehalten -> Aktion auslösen.");
+        return true;
+      }
+    }
+    Serial.println("[INFO] Reset-Taster < 2s gehalten -> Keine Aktion.");
+  }
+  return false;
+}
+
+void calibrateSensor(VL53L0X &sensor, int &calibMin, int &calibMax, const String &sensorLabel) {
+  Serial.println("[CAL] Starte Kalibrierung für " + sensorLabel + "...");
+  
+  unsigned long calibrationStartTime = millis();
+  const unsigned long calibrationDuration = 3000;
+  int currentMin = 8190;
+  int currentMax = 0;
+  int measurementCount = 0; 
+  int validMeasurements = 0; 
+  
+  Serial.println("[CAL] Messe 3 Sekunden lang (gültig, wenn Messwert nicht fehlerhaft)...");
+  while (millis() - calibrationStartTime < calibrationDuration) {
+    measurementCount++;
+    int distance = sensor.readRangeContinuousMillimeters();
+    if (distance < 8190 && distance > 0) {
+      if (distance < currentMin) currentMin = distance;
+      if (distance > currentMax) currentMax = distance;
+      validMeasurements++;
+      Serial.printf("[CAL] %s Versuch %d: Distanz=%d mm\n", sensorLabel.c_str(), measurementCount, distance);
+    } else {
+      Serial.printf("[CAL] %s Versuch %d: ungültige Messung (Code: %d)\n", sensorLabel.c_str(), measurementCount, distance);
+    }
+    delay(50);
+  }
+  
+  Serial.printf("[CAL] %s Kalibrierung beendet. Versuche=%d, gültige Messungen=%d\n", sensorLabel.c_str(), measurementCount, validMeasurements);
+  
+  if (validMeasurements > 2 && currentMin < 8190) {
+    calibMin = currentMin - 15;
+    if (calibMin < 5) calibMin = 5;
+    calibMax = currentMax + 15;
+    preferences.putInt(("minDistance" + sensorLabel.substring(6)).c_str(), calibMin);
+    preferences.putInt(("maxDistance" + sensorLabel.substring(6)).c_str(), calibMax);
+    Serial.printf("[CAL] %s erfolgreich: min=%d mm, max=%d mm\n", sensorLabel.c_str(), calibMin, calibMax);
+    addLogEntry("Calibration done for " + sensorLabel + ". Min=" + String(calibMin) +
+                ", Max=" + String(calibMax) + " (ValidCnt=" + String(validMeasurements) + ")");
+  } else {
+    Serial.println("[CAL][ERROR] " + sensorLabel + ": Nicht genügend gültige Messwerte.");
+    addLogEntry("Calibration failed for " + sensorLabel + " (Count=" + String(validMeasurements) + ")");
+    calibMin = 0;
+    calibMax = 0;
+    preferences.remove(("minDistance" + sensorLabel.substring(6)).c_str());
+    preferences.remove(("maxDistance" + sensorLabel.substring(6)).c_str());
+  }
+}
+
+void analyzeAndSendEventsSensor(const std::vector<int> &distances, int calibMin, int calibMax, const String &sensorLabel) {
+  if (distances.empty()) {
+    addLogEntry("Keine Messwerte zur Analyse für " + sensorLabel + ".");
+    return;
+  }
+  
+  int minVal = 8190;
+  int maxVal = 0;
+  for (int d : distances) {
+    if (d < minVal) minVal = d;
+    if (d > maxVal) maxVal = d;
+  }
+  
+  Serial.printf("[ANALYSE] %s: gemessen: Min=%d mm, Max=%d mm | Kalibrierung: Min=%d, Max=%d\n",
+                sensorLabel.c_str(), minVal, maxVal, calibMin, calibMax);
+  
+  const int doorThresholdMargin = 10;
+  const int letterThresholdMargin = 10;
+  
+  bool doorOpened = (maxVal > (calibMax + doorThresholdMargin));
+  bool letterDetected = (minVal < (calibMin - letterThresholdMargin));
+  
+  if (doorOpened) {
+    Serial.printf("[EVENT] %s: Tür geöffnet erkannt (Messwert %d > Kalibrierung %d + Margin)\n",
+                  sensorLabel.c_str(), maxVal, calibMax);
+    sendDoorEvent(maxVal, sensorLabel);
+  } else if (letterDetected) {
+    Serial.printf("[EVENT] %s: Brief erkannt (Messwert %d < Kalibrierung %d - Margin)\n",
+                  sensorLabel.c_str(), minVal, calibMin);
+    sendLetterEvent(minVal, sensorLabel);
+  } else {
+    addLogEntry("Kein spezifisches Event bei " + sensorLabel + " erkannt.");
+  }
+}
+
+std::vector<int> collectMeasurementsSensor(VL53L0X &sensor) {
+  std::vector<int> measurements;
+  unsigned long start = millis();
+  const unsigned long measureDuration = 10000;
+  while (millis() - start < measureDuration) {
+    int d = sensor.readRangeContinuousMillimeters();
+    if (d > 0 && d < 8190) {
+      measurements.push_back(d);
+    }
+    delay(30);
+  }
+  Serial.printf("[MEASURE] 10s Messung beendet. Gesammelte Werte: %d\n", measurements.size());
+  return measurements;
+}
+
+void sendMeasurementsForSensor(const std::vector<int> &measurements, const String &sensorLabel) {
+  if (measurements.empty()) {
+    addLogEntry("Keine Messwerte zum Senden von " + sensorLabel + ".");
+    return;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    addLogEntry("Kann Messwerte von " + sensorLabel + " nicht senden, kein WLAN.");
+    return;
+  }
+  
+  String mac = preferences.getString("mac_address", "Unbekannt");
+  DynamicJsonDocument doc(4096);
+  doc["mac_address"] = mac;
+  doc["sensor"] = sensorLabel;
+  JsonArray measureArray = doc.createNestedArray("measurements");
+  for (int measurement : measurements) {
+    measureArray.add(measurement);
+  }
+  
+  String payload;
+  serializeJson(doc, payload);
+  
+  Serial.println("[MEASURE] Sende Messwerte an Server -> /measurements für " + sensorLabel);
+  sendToServer(measurementsServerUrl, payload);
+  addLogEntry("Measurements sent for " + sensorLabel + ". Count=" + String(measurements.size()));
+}
+
+void sendToServer(const char* serverUrl, String jsonPayload) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.printf("[HTTP] Kein WLAN -> Kann nicht an %s senden.\n", serverUrl);
+    addLogEntry("HTTP Send failed (No WiFi) to " + String(serverUrl));
+    return;
+  }
+  
+  HTTPClient http;
+  if (!http.begin(serverUrl)) {
+    Serial.printf("[HTTP][ERROR] http.begin() fehlgeschlagen für URL: %s\n", serverUrl);
+    addLogEntry("HTTP begin failed for " + String(serverUrl));
+    return;
+  }
+  
+  http.addHeader("Content-Type", "application/json");
+  http.setConnectTimeout(5000);
+  http.setTimeout(10000);
+  
+  int httpCode = http.POST(jsonPayload);
+  
+  if (httpCode > 0) {
+    if (httpCode < 200 || httpCode >= 300) {
+      String response = http.getString();
+      Serial.printf("[HTTP][ERROR] URL: %s -> Code: %d, Resp: %s\n",
+                    serverUrl, httpCode, response.c_str());
+      addLogEntry("HTTP POST to " + String(serverUrl) +
+                  " failed with code: " + String(httpCode));
+    }
+  } else {
+    Serial.printf("[HTTP][ERROR] Fehler beim Senden an %s: %s\n",
+                  serverUrl, http.errorToString(httpCode).c_str());
+    addLogEntry("HTTP POST to " + String(serverUrl) +
+                " failed: " + http.errorToString(httpCode));
+  }
+  http.end();
+}
+
+void sendPing() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  String mac = preferences.getString("mac_address", "Unbekannt");
+  if (mac == "Unbekannt") return;
+  
+  HTTPClient http;
+  String url = String(ota_host) + "/ping";
+  if(!http.begin(url)) {
+    addLogEntry("OTA Ping http.begin() failed.");
+    return;
+  }
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(8000);
+  
+  StaticJsonDocument<256> doc;
+  doc["mac"] = mac;
+  doc["version"] = CURRENT_FIRMWARE_VERSION;
+  
+  String body;
+  serializeJson(doc, body);
+  
+  int code = http.POST(body);
+  if (code < 0) {
+    Serial.printf("[OTA] Ping Fehler: %s\n", http.errorToString(code).c_str());
+    addLogEntry("OTA Ping failed: " + http.errorToString(code));
+  }
+  http.end();
+}
+
+void checkDeviceFirmware() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  String mac = preferences.getString("mac_address", "Unbekannt");
+  if (mac == "Unbekannt") return;
+  
+  HTTPClient http;
+  String url = String(ota_host) + "/device_firmware.json?mac=" + mac;
+  if(!http.begin(url)) {
+    addLogEntry("OTA Check http.begin() failed.");
+    return;
+  }
+  http.setTimeout(8000);
+  
+  int code = http.GET();
+  
+  if (code == 200) {
+    String payload = http.getString();
+    DynamicJsonDocument doc(512);
+    DeserializationError err = deserializeJson(doc, payload);
+    
+    if (!err) {
+      const char* assignedVersion = doc["version"];
+      const char* firmwareUrl = doc["url"];
+      
+      if (assignedVersion) {
+        Serial.printf("[OTA] Aktuell: %s, Server: %s\n", CURRENT_FIRMWARE_VERSION, assignedVersion);
+        if (firmwareUrl && strlen(firmwareUrl) > 0 &&
+            String(assignedVersion) != CURRENT_FIRMWARE_VERSION) {
+          Serial.println("[OTA] Neuere Version verfügbar! Starte OTA Update...");
+          addLogEntry("New firmware version " + String(assignedVersion) +
+                      " available. Starting OTA.");
+          performOTA(String(firmwareUrl));
+        }
+      } else {
+        addLogEntry("OTA check failed: 'version' field missing in server response.");
+      }
+    } else {
+      addLogEntry("OTA check failed: JSON parse error - " + String(err.c_str()));
+    }
+  } else if (code != 404) {
+    addLogEntry("OTA check failed: HTTP " + String(code) +
+                " " + http.errorToString(code));
+  }
+  http.end();
+}
+
+void performOTA(String firmwareUrl) {
+  if (WiFi.status() != WL_CONNECTED) {
+    addLogEntry("OTA failed: No WiFi connection.");
+    return;
+  }
+  
+  Serial.printf("[OTA] Starte Download von: %s\n", firmwareUrl.c_str());
+  addLogEntry("Starting OTA download from " + firmwareUrl);
+  
+  HTTPClient http;
+  if (!http.begin(firmwareUrl)) {
+    addLogEntry("OTA download http.begin() failed.");
+    return;
+  }
+  http.setTimeout(60000);
+  
+  int code = http.GET();
+  if (code == 200) {
+    int contentLength = http.getSize();
+    if (contentLength <= 0) {
+      addLogEntry("OTA failed: Invalid Content-Length.");
+      http.end();
+      return;
+    }
+    Serial.printf("[OTA] Firmware Größe: %d Bytes\n", contentLength);
+    
+    if (!Update.begin(contentLength)) {
+      addLogEntry("OTA failed: Not enough space - " + String(Update.errorString()));
+      http.end();
+      return;
+    }
+    addLogEntry("OTA Update started. Size: " + String(contentLength));
+    Serial.println("[OTA] Update gestartet, schreibe Flash...");
+    
+    WiFiClient& stream = http.getStream();
+    size_t written = Update.writeStream(stream);
+    
+    if (written != contentLength) {
+      addLogEntry("OTA failed: Write error. Expected=" + String(contentLength) +
+                  ", Written=" + String(written) +
+                  ", Error: " + String(Update.errorString()));
+      Update.abort();
+      http.end();
+      return;
+    }
+    
+    if (!Update.end(true)) {
+      addLogEntry("OTA failed: Error ending update - " + String(Update.errorString()));
+    } else {
+      addLogEntry("OTA update finished successfully.");
+      Serial.println("[OTA] Update erfolgreich beendet!");
+      Serial.println("[OTA] Neustart in 3 Sekunden...");
+      addLogEntry("Rebooting after OTA.");
+      delay(3000);
+      ESP.restart();
+    }
+  } else {
+    addLogEntry("OTA download failed: HTTP " + String(code) +
+                " " + http.errorToString(code));
+  }
+  http.end();
+}
+
+void sendDeviceInfo() {
+  Serial.println("[DEV] Sende Geräteinfo...");
+  String mac = preferences.getString("mac_address", "Nicht gesetzt");
+  if (mac == "Nicht gesetzt") return;
+  
+  StaticJsonDocument<256> doc;
+  doc["mac_address"] = mac;
+  doc["firmware_version"] = CURRENT_FIRMWARE_VERSION;
+  
+  String jsonPayload;
+  serializeJson(doc, jsonPayload);
+  sendToServer(registrationServerUrl, jsonPayload);
+  addLogEntry("DeviceInfo sent.");
+}
+
+void sendCalibrationData() {
+  Serial.println("[CAL] Sende Kalibrierungsdaten...");
+  String mac = preferences.getString("mac_address", "Nicht gesetzt");
+  if (mac == "Nicht gesetzt") return;
+  
+  if (minDistance1 == 0 || maxDistance1 == 0 ||
+      minDistance2 == 0 || maxDistance2 == 0) {
+    Serial.println("[CAL][WARNUNG] Ungültige Kalibrierungsdaten vorhanden, überspringe Senden.");
+    addLogEntry("Skipped sending invalid calibration data (from Prefs).");
+    return;
+  }
+  
+  StaticJsonDocument<256> doc;
+  doc["mac_address"] = mac;
+  JsonObject sensor1Data = doc.createNestedObject("sensor1");
+  sensor1Data["min_distance"] = minDistance1;
+  sensor1Data["max_distance"] = maxDistance1;
+  JsonObject sensor2Data = doc.createNestedObject("sensor2");
+  sensor2Data["min_distance"] = minDistance2;
+  sensor2Data["max_distance"] = maxDistance2;
+  
+  String payload;
+  serializeJson(doc, payload);
+  sendToServer(calibrationServerUrl, payload);
+  addLogEntry("Calibration data sent for both sensors.");
+}
+
+void sendLetterEvent(int distance, const String &sensorLabel) {
+  Serial.println("[EVENT] Sende 'Brief erkannt' Event für " + sensorLabel + "...");
+  String mac = preferences.getString("mac_address", "Nicht gesetzt");
+  if (mac == "Nicht gesetzt") return;
+  
+  StaticJsonDocument<256> doc;
+  doc["mac_address"] = mac;
+  doc["sensor"] = sensorLabel;
+  doc["event"] = "letter_detected";
+  doc["distance"] = distance;
+  
+  String payload;
+  serializeJson(doc, payload);
+  sendToServer(letterServerUrl, payload);
+  addLogEntry("LetterEvent sent for " + sensorLabel + ". Dist=" + String(distance));
+}
+
+void sendDoorEvent(int distance, const String &sensorLabel) {
+  Serial.println("[EVENT] Sende 'Tür geöffnet' Event für " + sensorLabel + "...");
+  String mac = preferences.getString("mac_address", "Nicht gesetzt");
+  if (mac == "Nicht gesetzt") return;
+  
+  StaticJsonDocument<256> doc;
+  doc["mac_address"] = mac;
+  doc["sensor"] = sensorLabel;
+  doc["event"] = "door_opened";
+  doc["distance"] = distance;
+  
+  String payload;
+  serializeJson(doc, payload);
+  sendToServer(doorServerUrl, payload);
+  addLogEntry("DoorEvent sent for " + sensorLabel + ". Dist=" + String(distance));
+}
+
+void sendKeepAlive() {
+  Serial.println("[ALIVE] Sende KeepAlive...");
+  String mac = preferences.getString("mac_address", "Nicht gesetzt");
+  if (mac == "Nicht gesetzt") return;
+  
+  StaticJsonDocument<256> doc;
+  doc["mac_address"] = mac;
+  
+  String payload;
+  serializeJson(doc, payload);
+  sendToServer(keepaliveServerUrl, payload);
+  addLogEntry("KeepAlive sent.");
+}
+
+void addLogEntry(const String &entry) {
+  unsigned long ms = millis();
+  String newLine = "[T=" + String(ms) + "] " + entry + "\n";
+  logsBuffer += newLine;
+  Serial.println("[LOG] " + entry);
+}
+
+void sendLogs() {
+  if (logsBuffer.length() == 0) return;
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[LOG] Kein WLAN, Logs können nicht gesendet werden.");
+    return;
+  }
+  
+  String mac = preferences.getString("mac_address", "Unbekannt");
+  DynamicJsonDocument doc(2048);
+  doc["mac_address"] = mac;
+  JsonArray logsArray = doc.createNestedArray("logs");
+  
+  int startIndex = 0;
+  int endIndex = -1;
+  while (startIndex < logsBuffer.length()) {
+    endIndex = logsBuffer.indexOf('\n', startIndex);
+    if (endIndex == -1) {
+      String line = logsBuffer.substring(startIndex);
+      line.trim();
+      if (line.length() > 0) logsArray.add(line);
+      break;
+    } else {
+      String line = logsBuffer.substring(startIndex, endIndex);
+      line.trim();
+      if (line.length() > 0) logsArray.add(line);
+      startIndex = endIndex + 1;
+    }
+  }
+  
+  if (logsArray.size() == 0) {
+    Serial.println("[LOG] Nach dem Parsen keine gültigen Log-Zeilen zum Senden.");
+    logsBuffer = "";
+    return;
+  }
+  
+  String payload;
+  serializeJson(doc, payload);
+  Serial.println("[LOG] Sende Logs an Server -> /logs");
+  
+  HTTPClient http;
+  if (!http.begin(logsServerUrl)) {
+    addLogEntry("HTTP begin failed for /logs");
+    return;
+  }
+  http.addHeader("Content-Type", "application/json");
+  http.setConnectTimeout(5000);
+  http.setTimeout(10000);
+  int code = http.POST(payload);
+  
+  if (code > 0 && code < 300) {
+    Serial.printf("[HTTP] Logs gesendet, Server antwortet mit Code: %d\n", code);
+    logsBuffer = "";
+  } else {
+    Serial.printf("[HTTP][ERROR] Fehler beim Senden der Logs. Code: %d\n", code);
+    addLogEntry("Failed to send logs to server. HTTP Code: " + String(code));
+  }
+  http.end();
+}
+
+void configureDeepSleep() {
+  Serial.println("[DEEPSLEEP] Konfiguriere Deep Sleep...");
+  
+  esp_err_t ext0_result = esp_sleep_enable_ext0_wakeup(GPIO_NUM_27, 1);
+  if (ext0_result != ESP_OK) {
+    addLogEntry("Failed to configure EXT0 wakeup: " + String(esp_err_to_name(ext0_result)));
+  }
+  
+  uint64_t sleepTimeUs = (uint64_t)keepAliveInterval * 1000ULL;
+  esp_err_t timer_result = esp_sleep_enable_timer_wakeup(sleepTimeUs);
+  if (timer_result != ESP_OK) {
+    addLogEntry("Failed to configure Timer wakeup: " + String(esp_err_to_name(timer_result)));
+  }
+  
+  Serial.println("[DEEPSLEEP] Gehe jetzt schlafen...");
+  Serial.flush();
+  delay(100);
+  esp_deep_sleep_start();
+  Serial.println("[DEEPSLEEP] Dieser Text sollte NIE erscheinen!");
+}
