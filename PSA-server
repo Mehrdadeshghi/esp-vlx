@@ -1,0 +1,143 @@
+from flask import Flask, request, jsonify
+import mysql.connector
+
+app = Flask(__name__)
+
+# Datenbankverbindung initial
+db_config = {
+    "host": "localhost",
+    "user": "esp_user",
+    "password": "esp_password",
+    "database": "ESPv2"
+}
+
+def get_db_connection():
+    """Stellt eine sichere DB-Verbindung und neuen Cursor her."""
+    db = mysql.connector.connect(**db_config)
+    cursor = db.cursor(dictionary=True)
+    return db, cursor
+
+@app.route('/psa/register', methods=['POST'])
+def psa_register():
+    psa_mac = request.json.get('mac_address')
+    firmware_version = request.json.get('firmware_version')
+    name = request.json.get('name')  # Optional
+
+    if not psa_mac or not firmware_version:
+        return jsonify({"error": "Fehlende Daten"}), 400
+
+    db, cursor = get_db_connection()
+
+    try:
+        # Prüfen, ob PSA bereits existiert
+        cursor.execute("SELECT id FROM psa_devices WHERE mac_address = %s", (psa_mac,))
+        existing = cursor.fetchone()
+
+        if existing:
+            return jsonify({"message": "Bereits registriert", "psa_id": existing["id"]})
+
+        # Neuen PSA eintragen
+        cursor.execute("""
+            INSERT INTO psa_devices (mac_address, firmware_version, created_date, created_time, updated_date, updated_time, name)
+            VALUES (%s, %s, CURDATE(), CURTIME(), CURDATE(), CURTIME(), %s)
+        """, (psa_mac, firmware_version, name))
+        db.commit()
+
+        return jsonify({"message": "Registrierung erfolgreich"}), 201
+    finally:
+        cursor.close()
+        db.close()
+
+@app.route('/psa/status', methods=['POST'])
+def psa_status():
+    psa_mac = request.json.get('mac_address')
+
+    if not psa_mac:
+        return jsonify({"error": "MAC-Adresse fehlt"}), 400
+
+    db, cursor = get_db_connection()
+
+    try:
+        # Suche nach Verknüpfung in psa_links
+        cursor.execute("""
+            SELECT devices.id, devices.mac_address
+            FROM psa_links
+            JOIN psa_devices ON psa_links.psa_device_id = psa_devices.id
+            JOIN devices ON psa_links.esp_device_id = devices.id
+            WHERE psa_devices.mac_address = %s
+        """, (psa_mac,))
+        result = cursor.fetchone()
+
+        if not result:
+            return jsonify({"error": "Keine Berechtigung oder Zuordnung gefunden"}), 403
+
+        esp_id = result["id"]
+        esp_mac = result["mac_address"]
+
+        # Jetzt aktuellen Status aus mailbox_status holen
+        cursor.execute("""
+            SELECT current_status
+            FROM mailbox_status
+            WHERE device_id = %s
+        """, (esp_id,))
+        status_result = cursor.fetchone()
+
+        if not status_result:
+            return jsonify({"error": "Kein Status gefunden"}), 404
+
+        current_status = status_result["current_status"]
+
+        # Status-Text bestimmen
+        if current_status == 1:
+            status_text = "Post vorhanden"
+        else:
+            status_text = "Keine Post"
+
+        return jsonify({
+            "esp_mac_address": esp_mac,
+            "status": status_text
+        })
+    finally:
+        cursor.close()
+        db.close()
+
+@app.route('/psa/door_event', methods=['POST'])
+def psa_door_event():
+    psa_mac = request.json.get('mac_address')
+
+    if not psa_mac:
+        return jsonify({"error": "MAC-Adresse fehlt"}), 400
+
+    db, cursor = get_db_connection()
+
+    try:
+        # Finde den verlinkten ESP
+        cursor.execute("""
+            SELECT devices.id
+            FROM psa_links
+            JOIN psa_devices ON psa_links.psa_device_id = psa_devices.id
+            JOIN devices ON psa_links.esp_device_id = devices.id
+            WHERE psa_devices.mac_address = %s
+        """, (psa_mac,))
+        result = cursor.fetchone()
+
+        if not result:
+            return jsonify({"error": "Keine Verknüpfung gefunden"}), 403
+
+        esp_id = result["id"]
+
+        # Update mailbox_status
+        cursor.execute("""
+            UPDATE mailbox_status
+            SET current_status = 0, last_event_type = 'Door'
+            WHERE device_id = %s
+        """, (esp_id,))
+        db.commit()
+
+        return jsonify({"message": "Tür-Event gespeichert"}), 200
+    finally:
+        cursor.close()
+        db.close()
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5050)
