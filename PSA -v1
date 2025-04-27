@@ -1,0 +1,156 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+
+// WLAN-Zugangsdaten
+const char* ssid = "Eshghi2,4";
+const char* password = "SabziPolo";
+
+// Server-Adressen
+const char* registerUrl = "http://202.133.89.120:5050/psa/register";
+const char* statusUrl = "http://202.133.89.120:5050/psa/status";
+const char* doorEventUrl = "http://202.133.89.120:5050/psa/door_event";
+
+// Gerätedaten
+const char* firmwareVersion = "1.0.0";
+
+// Pins
+const int ledPin = 6;     // LED
+const int buttonPin = 0;  // Eingebaute Button GPIO0
+
+bool buttonPressed = false;
+
+String getMacAddress() {
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  char macStr[18];
+  sprintf(macStr, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return String(macStr);
+}
+
+void registerPSA() {
+  HTTPClient http;
+  http.begin(registerUrl);
+  http.addHeader("Content-Type", "application/json");
+
+  String macAddress = getMacAddress();
+  
+  StaticJsonDocument<200> doc;
+  doc["mac_address"] = macAddress;
+  doc["firmware_version"] = firmwareVersion;
+  doc["name"] = "PostStatusAnzeiger";
+
+  String requestBody;
+  serializeJson(doc, requestBody);
+
+  int httpResponseCode = http.POST(requestBody);
+
+  if (httpResponseCode > 0) {
+    Serial.println("Registrierung erfolgreich.");
+  } else {
+    Serial.print("Registrierung fehlgeschlagen: ");
+    Serial.println(httpResponseCode);
+  }
+
+  http.end();
+}
+
+void queryStatus() {
+  HTTPClient http;
+  http.begin(statusUrl);
+  http.addHeader("Content-Type", "application/json");
+
+  String macAddress = getMacAddress();
+
+  StaticJsonDocument<200> doc;
+  doc["mac_address"] = macAddress;
+
+  String requestBody;
+  serializeJson(doc, requestBody);
+
+  int httpResponseCode = http.POST(requestBody);
+
+  if (httpResponseCode > 0) {
+    String response = http.getString();
+    Serial.println("Statusantwort:");
+    Serial.println(response);
+
+    if (response.indexOf("Post vorhanden") != -1) {
+      digitalWrite(ledPin, HIGH); // LED an
+    } else {
+      digitalWrite(ledPin, LOW);  // LED aus
+    }
+
+  } else {
+    Serial.print("Statusabfrage fehlgeschlagen: ");
+    Serial.println(httpResponseCode);
+  }
+
+  http.end();
+}
+
+void sendDoorEvent() {
+  HTTPClient http;
+  http.begin(doorEventUrl);
+  http.addHeader("Content-Type", "application/json");
+
+  String macAddress = getMacAddress();
+
+  StaticJsonDocument<200> doc;
+  doc["mac_address"] = macAddress;
+
+  String requestBody;
+  serializeJson(doc, requestBody);
+
+  int httpResponseCode = http.POST(requestBody);
+
+  if (httpResponseCode > 0) {
+    Serial.println("Tür-Event gesendet.");
+  } else {
+    Serial.print("Tür-Event senden fehlgeschlagen: ");
+    Serial.println(httpResponseCode);
+  }
+
+  http.end();
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(ledPin, OUTPUT);
+  pinMode(buttonPin, INPUT_PULLUP);
+
+  // WLAN verbinden
+  WiFi.begin(ssid, password);
+  Serial.print("WLAN verbinden...");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWLAN verbunden!");
+
+  // Registrierung
+  registerPSA();
+}
+
+void loop() {
+  if (WiFi.status() == WL_CONNECTED) {
+    // Status immer live abfragen
+    queryStatus();
+
+    // Button-Überwachung
+    if (digitalRead(buttonPin) == LOW) { // Button gedrückt
+      if (!buttonPressed) {
+        Serial.println("Button gedrückt -> Tür-Event senden");
+        sendDoorEvent();
+        buttonPressed = true;
+      }
+    } else {
+      buttonPressed = false;
+    }
+
+  } else {
+    Serial.println("Keine WLAN-Verbindung.");
+  }
+
+  delay(1000); // Jede 1 Sekunde prüfen
+}
